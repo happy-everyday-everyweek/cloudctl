@@ -30,11 +30,7 @@ jobs:
 
       - name: 打包单文件 exe
         working-directory: agent
-        run: |
-          pyinstaller --noconfirm --clean --onefile --name cloudctl-agent ^
-            --hidden-import websockets --hidden-import pynput ^
-            --collect-submodules pynput --collect-submodules mss ^
-            run_agent.py
+        run: pyinstaller --noconfirm --clean --onefile --name cloudctl-agent --hidden-import websockets --hidden-import pynput --hidden-import pynput.keyboard --hidden-import pynput.mouse --collect-submodules pynput run_agent.py
 
       - uses: actions/upload-artifact@v4
         with:
