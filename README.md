@@ -1,37 +1,64 @@
-# cloudctl
+# cloudctl：Windows 实例群的集中控制与素材归档
 
-Windows 实例群的集中控制与素材归档系统。客户端（agent）+ 云控服务端（server）+ 内网穿透通道。
+> 用途限定：仅用于你本人拥有或已获得明确授权的 Windows 实例。请勿部署到他人设备上。
 
-> 用途限定：仅用于你本人拥有或已获得明确授权的 Windows 实例。
+## 它是什么
 
-## 组件
+一套自托管的实例管理工具。被管机器上跑一个 agent，agent 自己开一个端口、自带一个网页控制台，本机浏览器直接就能管自己；对外还有两条平行通道：WebSocket（走内网穿透）与 GitHub 仓库文件轮询。两条通道地位对等，任一条可用就能下发命令与规则，两条都断也不影响本机控制台。
 
-| 目录 | 内容 | 运行环境 |
-| --- | --- | --- |
-| `agent/` | Windows 客户端，PyInstaller 打包为单文件 exe | Windows 10/11 |
-| `server/` | 云控服务端，FastAPI + WebSocket + 网页控制台 | Win/Linux，需可被访问 |
-| `deploy/` | frp 内网穿透配置与安装脚本 | 服务端 + 各实例 |
-| `.github/workflows/` | 在 windows-latest 上自动打包 agent exe | GitHub 托管 |
+中心服务端（server/）是可选的集中视角，不装也能用。
 
-## 功能
+## 目录结构
 
-- 定时/条件触发的屏幕录制与摄像头拍照，触发条件（前台窗口切换、空闲状态、PPT 放映）由云控规则决定
-- 开机自启（Windows 计划任务，SYSTEM 上下文，无需登录即可运行）
-- 接收云控规则：WebSocket 主通道 + GitHub 仓库文件轮询备用通道
-- 远程桌面：JPEG 帧推流 + 鼠标键盘事件回注
-- 远程终端：长驻 PowerShell 会话，支持交互式命令
-- 远程文件管理：列目录、上传、下载、删除、重命名、新建目录
-- 素材自动归档：扫描 PPT/文档/图片/音频/视频，去重后按类型上传到指定 GitHub 仓库
+```
+cloudctl/
+├─ agent/            Windows 客户端（Python + PyInstaller 单文件 exe）
+│  ├─ cloudctl_agent/
+│  │  ├─ devsrv.py       设备本地服务：控制台 + HTTP API + MJPEG
+│  │  ├─ devstatic/      设备控制台前端（index.html、console.js）
+│  │  ├─ channel.py      两条平行通道（WS + GitHub）
+│  │  ├─ router.py       命令路由与权限门禁
+│  │  ├─ rules.py        规则引擎与触发判定
+│  │  ├─ ops.py          系统信息、终端、文件、进程
+│  │  ├─ capture.py      抓屏、摄像头、录制
+│  │  ├─ desktop.py      桌面流与输入注入
+│  │  ├─ sync.py         素材扫描与归档
+│  │  └─ startup.py      开机自启
+│  └─ run_agent.py
+├─ server/           FastAPI 中心服务端 + 网页控制台
+├─ deploy/           内网穿透配置（Cloudflare Tunnel 为主，frp 备选）
+├─ ctl/              rules.json 等控制文件
+└─ docs/             ARCHITECTURE.md、DEPLOY.md
+```
 
 ## 快速开始
 
-1. 服务端：`cd server && pip install -r requirements.txt && python -m app.main --host 0.0.0.0 --port 8787`
-2. 打通通道：`deploy/frpc.toml` 内指向你的 frps 地址，或用服务端所在机器的公网地址
-3. 客户端：`agent/config.json` 填 `server_url`、`server_token`、`device_id`
-4. 访问服务端网页控制台，设备上线后即可下发规则与命令
+下载 CI 产物 cloudctl-agent-windows（工作流 cloudctl-agent-windows artifact），或本地 pyinstaller 构建。把 config.example.json 改名为 config.json，至少填上 devsrv_token 与 gh_rules_repo。
 
-详细协议见 `docs/ARCHITECTURE.md`，部署步骤见 `docs/DEPLOY.md`。
+先只验本地：agent --console，浏览器打开 http://127.0.0.1:8788，登录后能看到设备信息、日志、桌面画面、命令面板。
+
+再验外联：agent --run，它会同时拉起本地控制台、WebSocket 通道与 GitHub 通道。
+
+装自启：agent --install；卸载：agent --uninstall；看状态：agent --status。
+
+## 功能
+
+条件触发的自拍与录屏（前台窗口切换、空闲、锁屏、PPT 放映等时机，配额与冷却可配）、开机自启、接收云控规则、远程桌面（MJPEG 帧流 + 输入注入）、远程终端（长驻 PowerShell 会话）、远程文件管理（列表、分段读、写、改、删、哈希）、素材扫描归档（PPT、文档、图片、音视频按类型落库到指定仓库）。
+
+## 安全默认值
+
+capture.photo、capture.video、upload.enabled 默认全部为 false，security.allow_delete 默认 false，需要时手动打开。本地服务默认只绑 127.0.0.1。服务端与设备端两侧权限是“与”关系，任一侧关闭则不执行。发到公网前请设长令牌，并在 Cloudflare 侧加 Access 策略。
 
 ## GitHub 作为存储后端的上限
 
-上传到 GitHub 仓库有几条硬限制，规划素材归档时必须先算好：单文件超过 100 MB 无法通过 API 提交，超过 50 MB 会告警；单次 Contents API 请求建议不超过 40 MB；仓库总体积 GitHub 有软性建议上限，长期堆积大量视频会被限制。因此视频类素材默认按 `segment_s` 切片，或改用 release 附件与对象存储。
+单文件超过 100MB 无法经 Contents API 提交，超过 50MB 会告警，单次请求建议不超过 40MB，仓库总体积有软上限；Release 附件单文件上限 2GB。归档模块里 upload_max_single_mb 默认 90，超限文件标记 too_large 跳过不重试。大视频需要切片或另走对象存储。
+
+## CI
+
+.github/workflows/build-agent.yml 在 windows-latest 上打包单文件 exe，携带 devstatic 静态资源，产出 artifact cloudctl-agent-windows；打 v* 标签时自动发 Release。
+
+## 文档
+
+docs/ARCHITECTURE.md 讲设计原则、三条入口、本地服务接口、两条平行通道、命令表、规则结构与存储上限。
+
+docs/DEPLOY.md 讲部署形态、Tunnel 映射、GitHub 通道、规则下发、验收清单与常见问题。
