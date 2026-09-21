@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cloudctl 设备控制台</title>
+<style>
+:root{--bg:#0f1215;--card:#171c21;--line:#242c34;--fg:#e6ebf0;--dim:#8b98a5;--acc:#3fa7ff;--ok:#3ddc84;--bad:#ff6b6b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,"Segoe UI",Arial,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--card);position:sticky;top:0;z-index:9}
+h1{font-size:15px;margin:0;font-weight:600}
+.muted{color:var(--dim)}
+.grow{flex:1}
+button{background:#222a31;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 10px;cursor:pointer;font:inherit}
+button:hover{border-color:var(--acc)}
+button.primary{background:var(--acc);color:#04121f;border-color:var(--acc)}
+input,select,textarea{background:#0d1114;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit}
+textarea{width:100%;min-height:72px;font-family:ui-monospace,Consolas,monospace;font-size:12px}
+main{padding:16px;display:grid;gap:16px;max-width:1080px;margin:0 auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+.card h2{margin:0 0 10px;font-size:12px;color:var(--dim);font-weight:600;letter-spacing:.06em;text-transform:uppercase}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+#view{width:100%;background:#000;border-radius:8px;min-height:240px;display:block}
+pre{margin:0;background:#0d1114;border:1px solid var(--line);border-radius:8px;padding:10px;max-height:300px;overflow:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--bad);display:inline-block}
+.dot.on{background:var(--ok)}
+#login{max-width:460px;margin:60px auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td,th{border-bottom:1px solid var(--line);padding:6px 4px;text-align:left}
+</style>
+</head>
+<body>
+<header>
+  <h1>cloudctl 设备控制台</h1>
+  <span class="muted" id="where">本机</span>
+  <span class="grow"></span>
+  <span class="dot" id="dot"></span>
+  <span class="muted" id="conn">未连接</span>
+  <button id="btnReload">刷新状态</button>
+</header>
+
+<section id="login" class="card">
+  <h2>令牌登录</h2>
+  <div class="row">
+    <input id="token" type="password" placeholder="设备令牌" style="flex:1;min-width:180px">
+    <button class="primary" id="btnLogin">登录</button>
+  </div>
+  <p class="muted">令牌取 config.json 的 devsrv_token，未设置时回退 server_token，再回退 device_id。默认只监听 127.0.0.1。</p>
+</section>
+
+<main id="app" hidden>
+  <section class="card">
+    <h2>设备概览</h2>
+    <div class="row" style="margin-bottom:10px">
+      <button id="btnInfo">agent.info</button>
+      <button id="btnSysinfo">sys.info</button>
+      <button id="btnLog">拉取日志</button>
+      <button id="btnScan">扫描素材</button>
+      <button id="btnSync">立即归档</button>
+    </div>
+    <pre id="out">就绪。</pre>
+  </section>
+
+  <section class="card">
+    <h2>桌面画面</h2>
+    <div class="row" style="margin-bottom:10px">
+      <label class="muted">帧率 <input id="fps" type="number" value="5" min="1" max="15" style="width:64px"></label>
+      <label class="muted">画质 <input id="quality" type="number" value="55" min="20" max="90" style="width:64px"></label>
+      <label class="muted">显示器 <input id="monitor" type="number" value="0" min="0" style="width:64px"></label>
+      <button class="primary" id="btnStream">开始推流</button>
+      <button id="btnShot">单帧截图</button>
+      <span class="muted" id="streamHint"></span>
+    </div>
+    <img id="view" alt="桌面画面">
+  </section>
+
+  <section class="card">
+    <h2>命令与文件</h2>
+    <div class="row">
+      <select id="op">
+        <option>agent.info</option>
+        <option>sys.info</option>
+        <option>sync.status</option>
+        <option>scan.now</option>
+        <option>shell.exec</option>
+        <option>file.list</option>
+        <option>file.hash</option>
+        <option>proc.list</option>
+        <option>agent.log</option>
+        <option>agent.rules</option>
+        <option>capture.photo</option>
+      </select>
+      <input id="argpath" placeholder="参数 path（可选）" style="flex:1;min-width:160px">
+      <button class="primary" id="btnCmd">执行</button>
+    </div>
+    <div style="margin-top:10px">
+      <textarea id="args" placeholder='额外参数 JSON，例如 {"cmd":"whoami","timeout_s":20}'></textarea>
+    </div>
+    <pre id="cmdOut" style="margin-top:10px">命令结果会显示在这里。</pre>
+  </section>
+
+  <section class="card">
+    <h2>规则下发</h2>
+    <div class="row">
+      <input id="ver" type="number" placeholder="version" value="1" style="width:120px">
+      <button class="primary" id="btnRules">应用规则</button>
+      <span class="muted">规则只能收紧权限，安全开关以两侧较严的一侧为准。</span>
+    </div>
+    <div style="margin-top:10px">
+      <textarea id="rules" placeholder='{"version":1,"capture":{"photo":{"enabled":true}}}'></textarea>
+    </div>
+    <pre id="rulesOut" style="margin-top:10px">等待下发。</pre>
+  </section>
+</main>
+
+<script src="/console.js"></script>
+</body>
+</html>
