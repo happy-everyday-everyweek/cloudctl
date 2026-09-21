@@ -1,0 +1,23 @@
+# frpc 客户端（跑在云控服务端所在的机器上，把 8787 暴露出去）
+# 注意：实例端不需要 frpc，agent 是主动拨出的
+serverAddr = "你的公网服务器地址"
+serverPort = 7000
+
+[auth]
+method = "token"
+token = "change-me-frp-token"
+
+[[proxies]]
+name = "cloudctl-server"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8787
+remotePort = 8787
+
+# 如果要用 https/wss，再加一个 vhost 转发
+# [[proxies]]
+# name = "cloudctl-https"
+# type = "https"
+# localIP = "127.0.0.1"
+# localPort = 8787
+# customDomains = ["ctl.example.com"]
