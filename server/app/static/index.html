@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang='zh-CN'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>cloudctl 控制台</title>
+<style>
+  :root { --bg:#0e1116; --panel:#161b22; --line:#242c37; --fg:#dfe6ef; --dim:#8b98a9; --accent:#4c8dff; --danger:#ff5d5d; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,'Segoe UI',Roboto,'Microsoft YaHei',sans-serif; background:var(--bg); color:var(--fg); }
+  header { display:flex; align-items:center; gap:12px; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); position:sticky; top:0; z-index:5; }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  .grow { flex:1; }
+  button, input, textarea, select { font:inherit; color:var(--fg); background:#0f141a; border:1px solid var(--line); border-radius:6px; padding:6px 10px; }
+  button { cursor:pointer; background:#1c2531; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { color:var(--danger); }
+  main { display:grid; grid-template-columns:280px 1fr; height:calc(100vh - 49px); }
+  aside { border-right:1px solid var(--line); overflow:auto; background:var(--panel); }
+  .dev { padding:10px 14px; border-bottom:1px solid var(--line); cursor:pointer; }
+  .dev:hover, .dev.active { background:#1b2431; }
+  .dev .name { font-weight:600; }
+  .dev .meta { color:var(--dim); font-size:12px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#555; margin-right:6px; }
+  .dot.on { background:#3ddc84; }
+  section { padding:14px 16px; overflow:auto; }
+  .tabs { display:flex; gap:6px; margin-bottom:12px; flex-wrap:wrap; }
+  .tabs button.active { border-color:var(--accent); color:#fff; background:#1d2a3d; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; margin-bottom:12px; }
+  pre { background:#0b0f14; border:1px solid var(--line); border-radius:6px; padding:10px; overflow:auto; max-height:380px; margin:0; white-space:pre-wrap; word-break:break-all; }
+  canvas { width:100%; height:auto; background:#000; border:1px solid var(--line); border-radius:6px; cursor:crosshair; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:500; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .dim { color:var(--dim); }
+  input.path { flex:1; min-width:180px; }
+  .hidden { display:none !important; }
+  #login { display:grid; place-items:center; height:100vh; }
+  #login .card { width:340px; }
+  a { color:var(--accent); text-decoration:none; }
+</style>
+</head>
+<body>
+
+<div id='login'>
+  <div class='card'>
+    <h1 style='margin-top:0'>cloudctl 控制台</h1>
+    <p class='dim'>输入服务端配置的控制台令牌</p>
+    <div class='row'><input id='tok' type='password' placeholder='console token' style='flex:1'><button class='primary' id='btnLogin'>进入</button></div>
+    <p id='loginErr' style='color:var(--danger)'></p>
+  </div>
+</div>
+
+<div id='app' class='hidden'>
+  <header>
+    <h1>cloudctl</h1>
+    <span id='counts' class='dim'></span>
+    <span class='grow'></span>
+    <span id='conn' class='dim'>链路：--</span>
+    <button id='btnRefresh'>刷新</button>
+  </header>
+  <main>
+    <aside id='devices'></aside>
+    <section id='detail'></section>
+  </main>
+</div>
+
+<script src='/console.js'></script>
+</body>
+</html>
