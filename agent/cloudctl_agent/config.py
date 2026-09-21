@@ -3,8 +3,8 @@
 配置优先级：环境变量 > config.json > 默认值。
 默认工作目录：Windows 为 %ProgramData%\\cloudctl，其他平台为 ~/.cloudctl。
 
-架构要点：每台实例自带本地服务（devsrv），本机浏览器即可管理自己；
-WebSocket 与 GitHub 两条外联通道平行对等，都不是本地控制台的前提。
+三类入口：设备本地控制台（devsrv）、两条平行外联通道（WS / GitHub）、
+局域网对等互联（mesh）。任何一类失效都不影响其余两类。
 """
 from __future__ import annotations
 
@@ -36,10 +36,24 @@ class Config:
 
     # 设备本地服务：自带控制台 + HTTP API
     devsrv_enabled: bool = True
-    devsrv_bind: str = "127.0.0.1"      # 局域网用 0.0.0.0
+    devsrv_bind: str = "127.0.0.1"
     devsrv_port: int = 8788
-    devsrv_token: str = ""              # 留空则回退 server_token，再回退 device_id
-    devsrv_public_url: str = ""         # 隧道/反代后的外部地址，仅用于展示
+    devsrv_token: str = ""
+    devsrv_public_url: str = ""
+
+    # 局域网互联：邻居发现 + 点对点命令转发
+    mesh_enabled: bool = True
+    mesh_group: str = ""              # 留空则用 group
+    mesh_bind: str = "0.0.0.0"
+    mesh_port: int = 8792
+    mesh_discovery_port: int = 8791
+    mesh_mcast: str = "239.255.42.99"
+    mesh_token: str = ""              # 留空则用 devsrv 令牌
+    mesh_announce_s: int = 20
+    mesh_ttl_s: int = 90
+    mesh_accept_cmd: bool = True      # 是否接受对端下发的命令（仍走同一权限门禁）
+    mesh_relay: bool = True
+    mesh_max_hops: int = 2
 
     # 通道一：WebSocket（内网穿透）
     server_url: str = ""
@@ -49,19 +63,23 @@ class Config:
     heartbeat_s: int = 25
 
     # 通道二：GitHub 仓库文件轮询（与通道一同级，不是备胎）
-    gh_rules_repo: str = ""            # owner/repo
+    gh_rules_repo: str = ""
     gh_rules_path: str = "ctl/rules.json"
-    gh_cmd_dir: str = "ctl/cmd"        # 每个设备一个文件 <device_id>.json
+    gh_cmd_dir: str = "ctl/cmd"
     gh_outbox_dir: str = "ctl/outbox"
     gh_token: str = ""
     gh_poll_s: int = 30
+    gh_api_base: str = "https://api.github.com"
+    gh_raw_base: str = "https://raw.githubusercontent.com"
+    gh_proxy: str = ""                 # 可选镜像前缀，如 https://ghfast.top
+    gh_backoff_max_s: int = 900         # 连续失败时的最长退避
 
     # 素材归档
     upload_repo: str = ""
     upload_branch: str = "main"
     upload_prefix: str = "kb"
     upload_token: str = ""
-    upload_mode: str = "auto"          # auto | contents | git
+    upload_mode: str = "auto"
     upload_max_single_mb: int = 90
     upload_concurrency: int = 2
 
@@ -107,15 +125,27 @@ class Config:
         return self.home_path / "rules.json"
 
     @property
+    def rules_cache(self) -> Path:
+        return self.home_path / "rules.remote.json"
+
+    @property
     def capture_dir(self) -> Path:
         p = self.home_path / "captures"
         p.mkdir(parents=True, exist_ok=True)
         return p
 
-    # --- 本地控制台 ---
+    # --- 本地控制台与互联 ---
     @property
     def devsrv_secret(self) -> str:
         return self.devsrv_token or self.server_token or self.device_id
+
+    @property
+    def mesh_secret(self) -> str:
+        return self.mesh_token or self.devsrv_secret
+
+    @property
+    def mesh_scope(self) -> str:
+        return self.mesh_group or self.group or "default"
 
     @property
     def devconsole_url(self) -> str:
@@ -170,8 +200,9 @@ class Config:
     def public(self) -> dict[str, Any]:
         """去掉凭据的副本，用于上报。"""
         d = asdict(self)
-        for k in ("server_token", "gh_token", "upload_token", "devsrv_token"):
+        for k in ("server_token", "gh_token", "upload_token", "devsrv_token", "mesh_token"):
             if d.get(k):
                 d[k] = "***"
         d["devconsole"] = self.devconsole_url
+        d["mesh_scope"] = self.mesh_scope
         return d
