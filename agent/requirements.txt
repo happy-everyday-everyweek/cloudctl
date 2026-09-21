@@ -1,0 +1,14 @@
+# 运行依赖
+websockets>=12.0
+requests>=2.31
+Pillow>=10.0
+mss>=9.0.1
+psutil>=5.9
+
+# 采集与输入（可用则启用，缺了会降级）
+opencv-python>=4.8
+numpy>=1.24
+pynput>=1.7
+
+# 打包
+pyinstaller>=6.0
