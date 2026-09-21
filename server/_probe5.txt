@@ -1,3 +1,0 @@
-A = 'x' + 'amp;';
-B = 'y' + 'quot;';
-C = myvar & othervar;
