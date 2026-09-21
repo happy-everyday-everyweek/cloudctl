@@ -1,11 +1,7 @@
 """云控服务端：设备连接、命令下发、规则管理、网页控制台。
 
-启动：
-    python -m app.main --host 0.0.0.0 --port 8787
-环境变量：
-    CLOUDCTL_AGENT_TOKEN    agent 连接令牌
-    CLOUDCTL_CONSOLE_TOKEN  控制台登录令牌
-    CLOUDCTL_DB             数据库路径（默认 ./cloudctl.db）
+启动： python -m app.main --host 0.0.0.0 --port 8787
+环境变量：CLOUDCTL_AGENT_TOKEN / CLOUDCTL_CONSOLE_TOKEN / CLOUDCTL_DB
 """
 from __future__ import annotations
 
@@ -21,6 +17,7 @@ from typing import Any
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from .store import Store
 
@@ -33,9 +30,9 @@ DB_PATH = Path(os.environ.get("CLOUDCTL_DB", str(BASE_DIR.parent / "cloudctl.db"
 
 store = Store(DB_PATH)
 app = FastAPI(title="cloudctl server", version="1.0.0")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
-# ------------------------------------------------------------------ 连接管理
 class Hub:
     def __init__(self) -> None:
         self.agents: dict[str, WebSocket] = {}
@@ -51,7 +48,7 @@ class Hub:
             except Exception:
                 pass
         self.agents[device_id] = ws
-        await self.broadcast_consoles({"type": "device.online", "device_id": device_id, "ts": int(time.time())})
+        await self.broadcast({"type": "device.online", "device_id": device_id, "ts": int(time.time())})
 
     def unregister_agent(self, device_id: str, ws: WebSocket) -> None:
         if self.agents.get(device_id) is ws:
@@ -88,9 +85,9 @@ class Hub:
         if fut and not fut.done():
             fut.set_result(payload)
 
-    async def broadcast_consoles(self, msg: dict) -> None:
-        dead = []
+    async def broadcast(self, msg: dict) -> None:
         text = json.dumps(msg, ensure_ascii=False)
+        dead = []
         for ws in list(self.consoles):
             try:
                 await ws.send_text(text)
@@ -118,13 +115,9 @@ class Hub:
 hub = Hub()
 
 
-# ------------------------------------------------------------------ 鉴权
 def _token_from(req: Request) -> str:
-    return (
-        req.headers.get("x-token")
-        or req.query_params.get("token")
-        or (req.cookies.get("cloudctl_token") or "")
-    )
+    return (req.headers.get("x-token") or req.query_params.get("token")
+            or (req.cookies.get("cloudctl_token") or ""))
 
 
 async def console_guard(req: Request) -> None:
@@ -132,7 +125,6 @@ async def console_guard(req: Request) -> None:
         raise HTTPException(401, "控制台令牌无效")
 
 
-# ------------------------------------------------------------------ 接口
 @app.get("/api/health")
 async def health() -> dict:
     return {"ok": True, "agents": list(hub.agents.keys()), "ts": int(time.time())}
@@ -208,7 +200,6 @@ async def api_audit(device_id: str = "", limit: int = 100) -> dict:
     return {"audit": store.list_audit(device_id, limit)}
 
 
-# ------------------------------------------------------------------ 设备通道
 @app.websocket("/ws/agent")
 async def ws_agent(ws: WebSocket) -> None:
     await ws.accept()
@@ -217,7 +208,6 @@ async def ws_agent(ws: WebSocket) -> None:
         await ws.close(code=4401, reason="bad token")
         return
     device_id = qp.get("device_id") or "unknown"
-    info: dict[str, Any] = {}
     try:
         while True:
             raw = await ws.receive_text()
@@ -227,43 +217,36 @@ async def ws_agent(ws: WebSocket) -> None:
                 continue
             mtype = msg.get("type")
             if mtype == "hello":
-                info = msg
                 store.upsert_device(
                     device_id, msg.get("name") or device_id, msg.get("group") or "default",
                     msg.get("os") or "", msg.get("ver") or "",
-                    ws.client.host if ws.client else "", msg,
-                )
+                    ws.client.host if ws.client else "", msg)
                 await hub.register_agent(device_id, ws)
                 rules = store.rules_for_device(device_id, msg.get("group") or "default")
                 if rules:
                     await ws.send_text(json.dumps(
-                        {"type": "rules", "version": rules.get("version", 0), "rules": rules}, ensure_ascii=False
-                    ))
-                continue
-            if mtype == "result":
+                        {"type": "rules", "version": rules.get("version", 0), "rules": rules},
+                        ensure_ascii=False))
+            elif mtype == "result":
                 hub.resolve(msg.get("id") or "", msg)
                 store.touch(device_id)
-                await hub.broadcast_consoles({"type": "result", "device_id": device_id, "result": msg})
-                continue
-            if mtype == "frame" or mtype == "stream.end":
+                await hub.broadcast({"type": "result", "device_id": device_id, "result": msg})
+            elif mtype in ("frame", "stream.end"):
                 await hub.relay_frames(device_id, msg)
-                continue
-            if mtype == "pong":
+            elif mtype == "pong":
                 store.touch(device_id)
-                continue
-            if mtype == "event":
+            elif mtype == "event":
                 store.touch(device_id)
-                await hub.broadcast_consoles({"type": "event", "device_id": device_id, "event": msg})
+                await hub.broadcast({"type": "event", "device_id": device_id, "event": msg})
     except WebSocketDisconnect:
         pass
     except Exception:
         pass
     finally:
         hub.unregister_agent(device_id, ws)
-        await hub.broadcast_consoles({"type": "device.offline", "device_id": device_id, "ts": int(time.time())})
+        await hub.broadcast({"type": "device.offline", "device_id": device_id, "ts": int(time.time())})
 
 
-# ------------------------------------------------------------------ 控制台通道
 @app.websocket("/ws/console")
 async def ws_console(ws: WebSocket) -> None:
     await ws.accept()
@@ -286,8 +269,7 @@ async def ws_console(ws: WebSocket) -> None:
             elif mtype == "desktop.start":
                 hub.watching[ws] = device_id
                 await hub.send_to_agent(device_id, {
-                    "type": "desktop.start", "id": uuid.uuid4().hex, "args": msg.get("args") or {}
-                })
+                    "type": "desktop.start", "id": uuid.uuid4().hex, "args": msg.get("args") or {}})
             elif mtype == "desktop.stop":
                 hub.watching.pop(ws, None)
                 await hub.send_to_agent(device_id, {"type": "desktop.stop", "id": uuid.uuid4().hex})
@@ -302,18 +284,12 @@ async def ws_console(ws: WebSocket) -> None:
         hub.watching.pop(ws, None)
 
 
-# ------------------------------------------------------------------ 控制台页面
 @app.get("/")
 async def index() -> Any:
     f = STATIC_DIR / "index.html"
     if not f.exists():
         return JSONResponse({"error": "缺少控制台页面"}, status_code=500)
     return FileResponse(f)
-
-
-@app.get("/api/config.json")
-async def client_config() -> dict:
-    return {"agenthint": "agents connect to wss://<host>/ws/agent"}
 
 
 def main() -> None:
