@@ -1,7 +1,8 @@
-"""agent 入口：装配各子系统、启动通道、运行自动采集与归档调度。
+"""agent 入口：装配各子系统、启动本地控制台与两条外联通道。
 
 命令行：
-    agent --run            常驻运行（计划任务/自启用）
+    agent --run            常驻运行（外联通道 + 本地控制台）
+    agent --console        仅本地控制台（不建外联通道）
     agent --install        安装开机自启
     agent --uninstall      移除开机自启
     agent --status         查看状态
@@ -24,13 +25,14 @@ from .capture import CaptureService
 from .channel import ControlChannel
 from .config import Config
 from .desktop import DesktopStreamer, InputInjector
+from .devsrv import STATIC, DeviceServer
 from .router import Router
 from .rules import RuleSet, TriggerEngine
 from .startup import install as startup_install, remove as startup_remove, status as startup_status
 from .sync import StateDB, SyncService
 from .util import IS_WINDOWS, foreground_window, idle_seconds, session_is_locked, set_dpi_aware, setup_logging
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 class Agent:
@@ -45,8 +47,10 @@ class Agent:
         self.sync = SyncService(self.rules, self.db, self.log)
         self.engine = TriggerEngine(self.rules)
         self.channel: ControlChannel | None = None
+        self.devsrv: DeviceServer | None = None
         self.router: Router | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
+        self.console_only = False
         self._stop = threading.Event()
         self._recording = False
         self._rec_status: dict = {}
@@ -84,13 +88,27 @@ class Agent:
             self.cfg, self.rules, self.capture, self.streamer, self.injector,
             self.sync, self.db, self.log, self.apply_rules,
         )
-        self.channel = ControlChannel(self.cfg, self.on_message, self.apply_rules, self.log)
+        self.devsrv = DeviceServer(
+            self.cfg, self.rules, self.capture, self.injector, self.sync, self.log,
+            get_router=lambda: self.router, get_loop=lambda: self.loop,
+        )
+        info = self.devsrv.start()
+        if info.get("enabled"):
+            self.log.info("设备本地控制台已就绪 %s", self.cfg.devconsole_url)
+        else:
+            self.log.info("设备本地控制台未启用（devsrv_enabled=false）")
         self.log.info(
             "cloudctl agent %s 启动 device=%s home=%s rules_v=%s",
             VERSION, self.cfg.device_id, self.cfg.home, self.rules.version,
         )
         threading.Thread(target=self._trigger_loop, name="trigger", daemon=True).start()
         threading.Thread(target=self._scan_loop, name="scan", daemon=True).start()
+        if self.console_only:
+            self.log.info("仅本地控制台模式：不建立外联通道")
+            while not self._stop.is_set():
+                await asyncio.sleep(0.5)
+            return
+        self.channel = ControlChannel(self.cfg, self.on_message, self.apply_rules, self.log)
         await self._emit({"type": "event", "event": "agent.online", "data": {"ver": VERSION, "rules": self.rules.version}})
         try:
             await self.channel.run()
@@ -190,6 +208,8 @@ class Agent:
 
     def stop(self) -> None:
         self._stop.set()
+        if self.devsrv is not None:
+            self.devsrv.stop()
 
 
 # ------------------------------------------------------------------ CLI
@@ -202,6 +222,8 @@ def _selftest() -> int:
             ok.append(f"{mod}: ok")
         except Exception as e:
             ok.append(f"{mod}: 缺失（{e}）")
+    static_ok = (STATIC / "index.html").exists() and (STATIC / "console.js").exists()
+    ok.append(f"devstatic: {'ok' if static_ok else '缺失'}")
     print("\n".join(ok))
     return 0
 
@@ -210,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser("cloudctl-agent")
     ap.add_argument("--config", default="")
     ap.add_argument("--run", action="store_true", help="常驻运行")
+    ap.add_argument("--console", action="store_true", help="仅启动本地控制台")
     ap.add_argument("--install", action="store_true", help="安装开机自启")
     ap.add_argument("--uninstall", action="store_true", help="移除开机自启")
     ap.add_argument("--status", action="store_true")
@@ -237,6 +260,10 @@ def main(argv: list[str] | None = None) -> int:
             "device_id": cfg.device_id, "device_name": cfg.device_name,
             "home": cfg.home, "rules_version": rules.version,
             "startup": startup_status(), "captures": str(cfg.capture_dir),
+            "devconsole": {"enabled": cfg.devsrv_enabled, "bind": cfg.devsrv_bind,
+                           "port": cfg.devsrv_port, "url": cfg.devconsole_url,
+                           "static": str(STATIC)},
+            "channels": {"ws": bool(cfg.server_url), "gh": bool(cfg.gh_rules_repo)},
         }, ensure_ascii=False, indent=2))
         return 0
     if args.rules:
@@ -256,11 +283,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     agent = Agent(cfg)
+    agent.console_only = bool(args.console)
 
     def _graceful(*_a):
         agent.stop()
 
-    for sig in (signal.SIGINT, signal.SIGTERM) if IS_WINDOWS is False else (signal.SIGINT, signal.SIGTERM):
+    for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             signal.signal(sig, _graceful)
         except Exception:
