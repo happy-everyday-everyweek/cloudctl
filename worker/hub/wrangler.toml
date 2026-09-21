@@ -1,0 +1,28 @@
+name = "cloudctl-hub"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+# 免费额度够用：Workers 免费版 10 万请求/天、CPU 10ms/请求；
+# Durable Objects 免费档按请求与持续时间计，长连接用 hibernation 基本不占时长。
+[observability]
+enabled = true
+
+[durable_objects]
+bindings = [
+  { name = "HUB", class_name = "Hub" }
+]
+
+# SQLite 后端的 Durable Objects 支持免费档
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Hub"]
+
+# 自定义域名（可选）。先在 Cloudflare 仪表盘把 hub.lumenbay.online 绑到这个 Worker，
+# 或者直接取消下面这行的注释用 wrangler 自动建路由。
+# routes = [
+#   { pattern = "hub.lumenbay.online", custom_domain = true }
+# ]
+
+# 变量：HUB_TOKEN 用 wrangler secret put HUB_TOKEN 写入，不要写在明文 vars 里。
+[vars]
+AUDIT_MAX = "500"
