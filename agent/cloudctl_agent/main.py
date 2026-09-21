@@ -1,4 +1,4 @@
-"""agent 入口：装配各子系统，启动本地控制台、局域网互联、声控采集与外联通道。
+"""agent 入口：装配各子系统，启动本地控制台、局域网互联、声控采集、OTA 与外联通道。
 
 命令行：
     agent --run                 常驻运行（全功能）
@@ -7,15 +7,12 @@
     agent --scan                立即跑一轮扫描归档
     agent --photo               立即截屏一张
     agent --rules PATH          应用规则文件
-    agent --mesh-peers          列出局域网邻居
-    agent --mesh-send ID OP     向邻居发命令
-    agent --cameras             列出可用摄像头
-    agent --audio-level N       打印 N 秒声音电平，便于定阈值
-    agent --mic-devices         列出输入设备
-    agent --chunk FILE          切分一个大文件（默认 40MB 一片）
-    agent --merge M.json OUT    按清单拼回原文件
-    agent --index               查看索引统计
-    agent --index-build         在本地生成一份仓库索引文件
+    agent --mesh-peers / --mesh-send ID OP
+    agent --cameras / --mic-devices / --audio-level N
+    agent --chunk FILE / --merge M.json OUT
+    agent --index / --index-search K / --index-build
+    agent --update-check        只看有没有新版本
+    agent --update-apply        下载并就地替换（会重启自己）
 """
 from __future__ import annotations
 
@@ -43,9 +40,10 @@ from .router import Router
 from .rules import RuleSet, TriggerEngine
 from .startup import install as startup_install, remove as startup_remove, status as startup_status
 from .sync import StateDB, SyncService
+from .updater import Updater, UpdateService
 from .util import IS_WINDOWS, foreground_window, idle_seconds, session_is_locked, set_dpi_aware, setup_logging
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 
 class Agent:
@@ -62,6 +60,9 @@ class Agent:
         self.sync = SyncService(self.rules, self.db, self.log, index=self.index,
                                 pool=self.pool, device_id=cfg.device_id,
                                 staging=cfg.home_path / "chunk_staging")
+        self.updater = Updater(cfg, self.rules, self.log, pool=self.pool, current_version=VERSION,
+                               exe_path=Path(sys.executable))
+        self.updates = UpdateService(self.updater, self.log)
         self.engine = TriggerEngine(self.rules)
         self.camcap: VoiceCameraService | None = None
         self.channel: ControlChannel | None = None
@@ -106,7 +107,7 @@ class Agent:
         self.loop = asyncio.get_running_loop()
         self.router = Router(
             self.cfg, self.rules, self.capture, self.streamer, self.injector,
-            self.sync, self.db, self.log, self.apply_rules,
+            self.sync, self.db, self.log, self.apply_rules, self.updater,
         )
         self.devsrv = DeviceServer(
             self.cfg, self.rules, self.capture, self.injector, self.sync, self.log,
@@ -125,6 +126,8 @@ class Agent:
         cinfo = self.camcap.start()
         if cinfo.get("enabled"):
             self.log.info("摄像头声控采集已启动，声卡引擎=%s", cinfo.get("audio") or "未启用")
+        if self.updates.start().get("enabled"):
+            self.log.info("OTA 已启用，当前版本 %s", VERSION)
         self.log.info("cloudctl agent %s 启动 device=%s home=%s rules_v=%s",
                       VERSION, self.cfg.device_id, self.cfg.home, self.rules.version)
         threading.Thread(target=self._trigger_loop, name="trigger", daemon=True).start()
@@ -235,7 +238,7 @@ class Agent:
 
     def stop(self) -> None:
         self._stop.set()
-        for svc in (self.devsrv, self.mesh, self.camcap):
+        for svc in (self.devsrv, self.mesh, self.camcap, self.updates):
             if svc is not None:
                 try:
                     svc.stop()
@@ -256,6 +259,7 @@ def _selftest() -> int:
     static_ok = (STATIC / "index.html").exists() and (STATIC / "console.js").exists()
     ok.append(f"devstatic: {'ok' if static_ok else '缺失'}")
     ok.append(f"cameras: {CameraRecorder.list_cameras()}")
+    ok.append(f"frozen: {bool(getattr(sys, 'frozen', False))}")
     print("\n".join(ok))
     return 0
 
@@ -318,15 +322,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--mesh-peers", action="store_true")
     ap.add_argument("--mesh-wait", type=int, default=8)
     ap.add_argument("--mesh-send", nargs="+", default=None)
-    ap.add_argument("--cameras", action="store_true", help="列出可用摄像头")
-    ap.add_argument("--mic-devices", action="store_true", help="列出输入设备")
-    ap.add_argument("--audio-level", type=int, default=0, help="打印 N 秒声音电平")
-    ap.add_argument("--chunk", default="", help="切分指定文件")
+    ap.add_argument("--cameras", action="store_true")
+    ap.add_argument("--mic-devices", action="store_true")
+    ap.add_argument("--audio-level", type=int, default=0)
+    ap.add_argument("--chunk", default="")
     ap.add_argument("--chunk-mb", type=float, default=40.0)
-    ap.add_argument("--merge", nargs=2, default=None, help="--merge 清单 输出文件")
-    ap.add_argument("--index", action="store_true", help="查看索引统计")
-    ap.add_argument("--index-build", action="store_true", help="生成仓库索引文件")
-    ap.add_argument("--index-search", default="", help="按关键词搜索引")
+    ap.add_argument("--merge", nargs=2, default=None)
+    ap.add_argument("--index", action="store_true")
+    ap.add_argument("--index-build", action="store_true")
+    ap.add_argument("--index-search", default="")
+    ap.add_argument("--update-check", action="store_true", help="检查是否有新版本")
+    ap.add_argument("--update-apply", action="store_true", help="下载并替换自身")
+    ap.add_argument("--update-tag", default="", help="指定要升到的 tag")
     args = ap.parse_args(argv)
 
     if args.selftest:
@@ -341,6 +348,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.uninstall:
         print(json.dumps(startup_remove(log), ensure_ascii=False, indent=2))
         return 0
+    if args.update_check or args.update_apply:
+        rules = RuleSet.load(cfg.rules_file)
+        pool = MirrorPool(cfg.home_path, log, pool_json=cfg.gh_mirror_pool, top=cfg.gh_mirror_top)
+        if args.update_tag:
+            rules.data.setdefault("update", {})
+            rules.data["update"]["channel"] = "tag"
+            rules.data["update"]["tag"] = args.update_tag
+        up = Updater(cfg, rules, log, pool=pool, current_version=VERSION, exe_path=Path(sys.executable))
+        if args.update_check:
+            print(json.dumps(up.check(), ensure_ascii=False, indent=2))
+            return 0
+        res = up.run_once(apply_if_newer=True)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0
     if args.mesh_peers:
         return _mesh_probe(cfg, args.mesh_wait)
     if args.mesh_send:
@@ -349,8 +370,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"cameras": CameraRecorder.list_cameras()}, ensure_ascii=False, indent=2))
         return 0
     if args.mic_devices:
-        meter = AudioMeter()
-        print(json.dumps({"devices": meter.devices()}, ensure_ascii=False, indent=2))
+        print(json.dumps({"devices": AudioMeter().devices()}, ensure_ascii=False, indent=2))
         return 0
     if args.audio_level:
         return _audio_probe(cfg, args.audio_level)
@@ -380,6 +400,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.status:
         rules = RuleSet.load(cfg.rules_file)
         idx = LocalIndex(cfg.home_path / "index.db")
+        up = Updater(cfg, rules, log, current_version=VERSION, exe_path=Path(sys.executable))
         print(json.dumps({
             "version": VERSION,
             "device_id": cfg.device_id, "device_name": cfg.device_name,
@@ -398,6 +419,7 @@ def main(argv: list[str] | None = None) -> int:
                         "audio_trigger": rules.audio.get("enabled"),
                         "threshold_db": rules.audio.get("threshold_db"),
                         "chunk_mb": rules.chunk.get("size_mb")},
+            "ota": up.status(),
             "index": idx.summary(),
         }, ensure_ascii=False, indent=2))
         return 0
