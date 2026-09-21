@@ -1,12 +1,15 @@
-"""命令路由：把服务端下发的消息分发到具体子系统。
+"""命令路由：把服务端、本地控制台或局域网邻居下发的消息分发到具体子系统。
 
-所有破坏性操作都过一遍规则里的 security 开关，服务端与客户端
-dua 重门禁，任意一侧关闭都不执行。
+所有破坏性操作都过一遍规则里的 security 开关，服务端与客户端双重门禁，
+任意一侧关闭都不执行。OTA 相关动作统一走 agent.update 这一个入口。
 """
 from __future__ import annotations
 
 import asyncio
+import os
+import threading
 import time
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from . import ops, startup
@@ -27,6 +30,7 @@ class Router:
         db,
         log,
         apply_rules: Callable[[dict, int], Awaitable[None]],
+        updater=None,
     ) -> None:
         self.cfg = cfg
         self.rules = rules
@@ -37,6 +41,7 @@ class Router:
         self.db = db
         self.log = log
         self.apply_rules = apply_rules
+        self.updater = updater
         self.sessions: dict[str, ops.ShellSession] = {}
         self.stats = {"commands": 0, "errors": 0, "started_ts": int(time.time())}
 
@@ -157,6 +162,12 @@ class Router:
                 int(args.get("seconds") or 60), int(args.get("fps") or 5),
                 int(args.get("quality") or 60), int(args.get("monitor") or 0), args.get("path"),
             )
+        if op == "camera.status":
+            return {"enabled": self.rules.camera.get("enabled"),
+                    "index": self.rules.camera.get("index"),
+                    "audio_enabled": self.rules.audio.get("enabled"),
+                    "threshold_db": self.rules.audio.get("threshold_db"),
+                    "segment_s": self.rules.camera.get("segment_s")}
 
         # --- 归档 ---
         if op == "scan.now":
@@ -166,18 +177,39 @@ class Router:
             for f in files:
                 by_kind[f.kind] = by_kind.get(f.kind, 0) + 1
                 total += f.size
-            return {"count": len(files), "bytes": total, "bytes_h": human_size(total), "by_kind": by_kind, "roots": self.rules.scan.get("roots")}
+            return {"count": len(files), "bytes": total, "bytes_h": human_size(total),
+                    "by_kind": by_kind, "roots": self.rules.scan.get("roots")}
         if op == "sync.now":
             return await asyncio.to_thread(self.sync.sync_once, int(args.get("limit") or 500))
         if op == "sync.status":
-            return {"db": self.db.summary(), "last_run": self.sync.last_run, "pending": len(self.db.pending())}
+            return {"db": self.db.summary(), "last_run": self.sync.last_run,
+                    "pending": len(self.db.pending())}
+        if op == "index.status":
+            idx = getattr(self.sync, "index", None)
+            return idx.summary() if idx is not None else {"err": "未装配索引"}
+        if op == "index.search":
+            idx = getattr(self.sync, "index", None)
+            if idx is None:
+                return {"hits": []}
+            return {"hits": idx.search(args.get("keyword") or "", int(args.get("limit") or 50))}
+        if op == "index.upload":
+            return {"files": await asyncio.to_thread(self.sync.upload_index)}
+
+        # --- OTA ---
+        if op == "agent.update":
+            return await self._update(args)
 
         # --- 规则与自身 ---
         if op == "agent.rules":
             await self.apply_rules(args.get("rules") or {}, int(args.get("version") or 0))
             return {"version": self.rules.version, "applied": True}
         if op == "agent.autostart":
-            return await asyncio.to_thread(startup.status if args.get("action", "install") == "status" else (startup.remove if args.get("action") == "remove" else startup.install), self.cfg.home_path, self.log) if args.get("action") != "status" else await asyncio.to_thread(startup.status)
+            action = args.get("action", "install")
+            if action == "status":
+                return await asyncio.to_thread(startup.status)
+            if action == "remove":
+                return await asyncio.to_thread(startup.remove, self.log)
+            return await asyncio.to_thread(startup.install, self.cfg.home_path, self.log)
         if op == "agent.log":
             log_path = self.cfg.home_path / "agent.log"
             n = int(args.get("lines") or 200)
@@ -188,6 +220,38 @@ class Router:
             return {"lines": [ln.rstrip("\n") for ln in lines]}
 
         raise ValueError(f"未知命令：{op}")
+
+    # ------------------------------------------------------------ OTA
+    async def _update(self, args: dict) -> Any:
+        up = self.updater
+        if up is None:
+            raise ValueError("OTA 未装配")
+        action = str(args.get("action") or "check")
+        if action == "status":
+            return up.status()
+        if action == "check":
+            return await asyncio.to_thread(up.check)
+        if action == "download":
+            res = await asyncio.to_thread(up.check)
+            if not res.get("ok") or not res.get("newer"):
+                return res
+            res["download"] = await asyncio.to_thread(up.download, res.get("asset") or {})
+            return res
+        if action == "apply":
+            path = args.get("path")
+            if not path:
+                res = await asyncio.to_thread(up.check)
+                dl = await asyncio.to_thread(up.download, res.get("asset") or {})
+                if not dl.get("ok"):
+                    return {"check": res, "download": dl}
+                path = dl.get("path")
+            info = await asyncio.to_thread(up.apply, Path(str(path)), bool(args.get("restart", True)))
+            if info.get("ok"):
+                delay = float(args.get("exit_in_s") or 2.0)
+                self.log.warning("OTA 即将替换自身并重启，进程将在 %s 秒后退出", delay)
+                threading.Timer(delay, lambda: os._exit(0)).start()
+            return info
+        raise ValueError(f"未知 update action：{action}")
 
     @staticmethod
     def _require(cond: bool, msg: str) -> None:
