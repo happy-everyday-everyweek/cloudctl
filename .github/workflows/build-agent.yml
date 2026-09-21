@@ -30,7 +30,11 @@ jobs:
 
       - name: 打包单文件 exe
         working-directory: agent
-        run: pyinstaller --noconfirm --clean --onefile --name cloudctl-agent --hidden-import websockets --hidden-import pynput --hidden-import pynput.keyboard --hidden-import pynput.mouse --collect-submodules pynput run_agent.py
+        run: pyinstaller --noconfirm --clean --onefile --name cloudctl-agent --add-data "cloudctl_agent/devstatic;cloudctl_agent/devstatic" --hidden-import websockets --hidden-import pynput --hidden-import pynput.keyboard --hidden-import pynput.mouse --collect-submodules pynput run_agent.py
+
+      - name: 静态资源检查
+        working-directory: agent
+        run: dir cloudctl_agent\devstatic
 
       - uses: actions/upload-artifact@v4
         with:
