@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "identity": {
+    "display_name": "",
+    "tags": ["lab"]
+  },
+  "capture": {
+    "photo": {
+      "enabled": false,
+      "device": "screen",
+      "min_interval_s": 600,
+      "max_per_day": 50,
+      "active_hours": ["08:00", "22:00"],
+      "settle_s": 3,
+      "when": {
+        "only_if_idle_s": 0,
+        "on_foreground_change": true,
+        "on_session_unlock": false
+      }
+    },
+    "video": {
+      "enabled": false,
+      "segment_s": 60,
+      "fps": 5,
+      "quality": 60,
+      "monitor": 0,
+      "max_mb_per_day": 500,
+      "active_hours": ["08:00", "22:00"],
+      "settle_s": 5,
+      "cooldown_s": 10,
+      "when": {
+        "on_foreground_change": true,
+        "on_slideshow": true,
+        "idle_skip": true,
+        "idle_skip_s": 300,
+        "exclude_titles": ["*Password*", "*隐私*"]
+      }
+    },
+    "slideshow": {
+      "enabled": true,
+      "titles": ["PowerPoint 幻灯片放映", "Slide Show", "Presentation"],
+      "threshold": 12,
+      "cooldown_s": 3
+    }
+  },
+  "scan": {
+    "roots": [
+      "C:/Users/Public/Documents",
+      "D:/course"
+    ],
+    "interval_min": 30,
+    "follow_links": false,
+    "max_file_mb": 4096,
+    "types": {
+      "doc": ["ppt", "pptx", "doc", "docx", "pdf", "xls", "xlsx", "md", "txt"],
+      "image": ["jpg", "jpeg", "png", "webp", "gif", "bmp", "heic"],
+      "audio": ["mp3", "wav", "flac", "m4a", "aac", "ogg"],
+      "video": ["mp4", "mov", "mkv", "avi", "webm"]
+    },
+    "exclude_globs": [
+      "*/node_modules/*",
+      "*/.git/*",
+      "*/AppData/Local/Temp/*",
+      "*/Windows/*",
+      "*/$Recycle.Bin/*"
+    ]
+  },
+  "upload": {
+    "enabled": false,
+    "repo": "happy-everyday-everyweek/knowledge-base",
+    "branch": "main",
+    "path_prefix": "kb",
+    "layout": "{prefix}/{type}/{yyyy}/{mm}/{name}",
+    "dedup": "sha256",
+    "max_single_mb": 90,
+    "chunk_video": true,
+    "chunk_seconds": 600,
+    "concurrency": 2
+  },
+  "desktop": {
+    "max_fps": 10,
+    "allow_input": true,
+    "monitors": 1,
+    "quality": 60
+  },
+  "security": {
+    "allow_shell": true,
+    "allow_file_write": true,
+    "allow_delete": false
+  }
+}
