@@ -1,0 +1,50 @@
+name: build-agent
+
+on:
+  push:
+    tags: ['v*']
+    branches: [main]
+    paths: ['agent/**', '.github/workflows/build-agent.yml']
+  workflow_dispatch:
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: 安装依赖
+        working-directory: agent
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 代码自检
+        working-directory: agent
+        run: python -m compileall -q cloudctl_agent run_agent.py
+
+      - name: 打包单文件 exe
+        working-directory: agent
+        run: |
+          pyinstaller --noconfirm --clean --onefile --name cloudctl-agent ^
+            --hidden-import websockets --hidden-import pynput ^
+            --collect-submodules pynput --collect-submodules mss ^
+            run_agent.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cloudctl-agent-windows
+          path: agent/dist/cloudctl-agent.exe
+          if-no-files-found: error
+
+      - name: 打 Tag 时发布 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: agent/dist/cloudctl-agent.exe
+          generate_release_notes: true
