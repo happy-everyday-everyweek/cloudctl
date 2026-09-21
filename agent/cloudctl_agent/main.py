@@ -1,14 +1,16 @@
-"""agent 入口：装配各子系统、启动本地控制台与两条外联通道。
+"""agent 入口：装配各子系统、启动本地控制台、局域网互联与两条平行通道。
 
 命令行：
-    agent --run            常驻运行（外联通道 + 本地控制台）
-    agent --console        仅本地控制台（不建外联通道）
-    agent --install        安装开机自启
-    agent --uninstall      移除开机自启
-    agent --status         查看状态
-    agent --scan           只跑一轮扫描归档
-    agent --photo          立即拍一张屏幕图
-    agent --rules PATH     应用规则文件
+    agent --run                常驻运行（本地控制台 + 局域网互联 + 外联通道）
+    agent --console            仅本地控制台与局域网互联，不建外联通道
+    agent --install            安装开机自启
+    agent --uninstall          移除开机自启
+    agent --status             查看状态
+    agent --scan               只跑一轮扫描归档
+    agent --photo              立即拍一张屏幕图
+    agent --rules PATH         应用规则文件
+    agent --mesh-peers         列出局域网邻居（监听若干秒后输出）
+    agent --mesh-send ID OP    向邻居发一条命令，可跟 JSON 参数
 """
 from __future__ import annotations
 
@@ -26,13 +28,14 @@ from .channel import ControlChannel
 from .config import Config
 from .desktop import DesktopStreamer, InputInjector
 from .devsrv import STATIC, DeviceServer
+from .mesh import MeshService
 from .router import Router
 from .rules import RuleSet, TriggerEngine
 from .startup import install as startup_install, remove as startup_remove, status as startup_status
 from .sync import StateDB, SyncService
 from .util import IS_WINDOWS, foreground_window, idle_seconds, session_is_locked, set_dpi_aware, setup_logging
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 class Agent:
@@ -48,6 +51,7 @@ class Agent:
         self.engine = TriggerEngine(self.rules)
         self.channel: ControlChannel | None = None
         self.devsrv: DeviceServer | None = None
+        self.mesh: MeshService | None = None
         self.router: Router | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.console_only = False
@@ -69,7 +73,8 @@ class Agent:
     async def on_message(self, msg: dict):
         mtype = msg.get("type")
         if mtype == "desktop.start" and self.router is not None:
-            res = await self.streamer.start(self.channel.send, **(msg.get("args") or {}))
+            sender = self.channel.send if self.channel else None
+            res = await self.streamer.start(sender, **(msg.get("args") or {}))
             return {"type": "result", "id": msg.get("id"), "op": "desktop.start", "ok": True, "data": res}
         if mtype == "desktop.stop":
             res = await self.streamer.stop()
@@ -93,10 +98,13 @@ class Agent:
             get_router=lambda: self.router, get_loop=lambda: self.loop,
         )
         info = self.devsrv.start()
-        if info.get("enabled"):
-            self.log.info("设备本地控制台已就绪 %s", self.cfg.devconsole_url)
-        else:
-            self.log.info("设备本地控制台未启用（devsrv_enabled=false）")
+        self.log.info("设备本地控制台%s %s", "已就绪" if info.get("enabled") else "未启用",
+                      self.cfg.devconsole_url)
+        self.mesh = MeshService(self.cfg, self.log, run_cmd=self.devsrv.run_cmd, agent_version=VERSION)
+        minfo = self.mesh.start()
+        if minfo.get("enabled"):
+            self.log.info("局域网互联 mesh=%s http=%s 发现端口=%s",
+                          self.cfg.mesh_scope, self.cfg.mesh_port, self.cfg.mesh_discovery_port)
         self.log.info(
             "cloudctl agent %s 启动 device=%s home=%s rules_v=%s",
             VERSION, self.cfg.device_id, self.cfg.home, self.rules.version,
@@ -104,7 +112,7 @@ class Agent:
         threading.Thread(target=self._trigger_loop, name="trigger", daemon=True).start()
         threading.Thread(target=self._scan_loop, name="scan", daemon=True).start()
         if self.console_only:
-            self.log.info("仅本地控制台模式：不建立外联通道")
+            self.log.info("仅本地模式：不建立外联通道")
             while not self._stop.is_set():
                 await asyncio.sleep(0.5)
             return
@@ -208,8 +216,12 @@ class Agent:
 
     def stop(self) -> None:
         self._stop.set()
-        if self.devsrv is not None:
-            self.devsrv.stop()
+        for svc in (self.devsrv, self.mesh):
+            if svc is not None:
+                try:
+                    svc.stop()
+                except Exception:
+                    pass
 
 
 # ------------------------------------------------------------------ CLI
@@ -228,11 +240,30 @@ def _selftest() -> int:
     return 0
 
 
+def _mesh_probe(cfg: Config, seconds: int, send: list[str] | None = None) -> int:
+    log = setup_logging(cfg.home_path, cfg.log_level, cfg.log_max_mb, cfg.log_keep)
+    mesh = MeshService(cfg, log, run_cmd=lambda op, args, timeout=60.0: {"ok": False, "err": "探测模式不执行命令"})
+    mesh.start()
+    deadline = time.time() + max(1, seconds)
+    while time.time() < deadline:
+        time.sleep(0.5)
+    peers = mesh.peers_list()
+    if send:
+        target, op = send[0], send[1]
+        args = json.loads(send[2]) if len(send) > 2 and send[2] else {}
+        res = mesh.send_cmd(target, op, args)
+        print(json.dumps({"peers": peers, "result": res}, ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps({"mesh": cfg.mesh_scope, "peers": peers}, ensure_ascii=False, indent=2))
+    mesh.stop()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser("cloudctl-agent")
     ap.add_argument("--config", default="")
     ap.add_argument("--run", action="store_true", help="常驻运行")
-    ap.add_argument("--console", action="store_true", help="仅启动本地控制台")
+    ap.add_argument("--console", action="store_true", help="仅本地控制台与局域网互联")
     ap.add_argument("--install", action="store_true", help="安装开机自启")
     ap.add_argument("--uninstall", action="store_true", help="移除开机自启")
     ap.add_argument("--status", action="store_true")
@@ -240,6 +271,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--photo", action="store_true", help="立即截屏一张")
     ap.add_argument("--rules", default="", help="应用规则文件")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--mesh-peers", action="store_true", help="列出局域网邻居")
+    ap.add_argument("--mesh-wait", type=int, default=8, help="邻居监听秒数")
+    ap.add_argument("--mesh-send", nargs="+", default=None, help="向邻居发命令：ID OP [JSON参数]")
     args = ap.parse_args(argv)
 
     if args.selftest:
@@ -254,16 +288,26 @@ def main(argv: list[str] | None = None) -> int:
     if args.uninstall:
         print(json.dumps(startup_remove(log), ensure_ascii=False, indent=2))
         return 0
+    if args.mesh_peers:
+        return _mesh_probe(cfg, args.mesh_wait)
+    if args.mesh_send:
+        return _mesh_probe(cfg, args.mesh_wait, args.mesh_send)
     if args.status:
         rules = RuleSet.load(cfg.rules_file)
         print(json.dumps({
+            "version": VERSION,
             "device_id": cfg.device_id, "device_name": cfg.device_name,
             "home": cfg.home, "rules_version": rules.version,
             "startup": startup_status(), "captures": str(cfg.capture_dir),
             "devconsole": {"enabled": cfg.devsrv_enabled, "bind": cfg.devsrv_bind,
                            "port": cfg.devsrv_port, "url": cfg.devconsole_url,
                            "static": str(STATIC)},
-            "channels": {"ws": bool(cfg.server_url), "gh": bool(cfg.gh_rules_repo)},
+            "mesh": {"enabled": cfg.mesh_enabled, "scope": cfg.mesh_scope,
+                     "port": cfg.mesh_port, "discovery_port": cfg.mesh_discovery_port,
+                     "accept_cmd": cfg.mesh_accept_cmd, "relay": cfg.mesh_relay,
+                     "max_hops": cfg.mesh_max_hops},
+            "channels": {"ws": bool(cfg.server_url), "gh": bool(cfg.gh_rules_repo),
+                         "gh_mirror": cfg.gh_proxy or ""},
         }, ensure_ascii=False, indent=2))
         return 0
     if args.rules:
