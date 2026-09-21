@@ -1,0 +1,20 @@
+# frps 服务端（部署在具有公网地址的机器上）
+bindPort = 7000
+
+# 鉴权：agent/控制台都要走这条链路，务必改掉
+[auth]
+method = "token"
+token = "change-me-frp-token"
+
+# 仪表盘，可选，用于看连接数
+webServer.addr = "0.0.0.0"
+webServer.port = 7500
+webServer.user = "admin"
+webServer.password = "change-me-dashboard"
+
+# 传帧量大，调高单连接吞吐上限
+transport.maxPoolCount = 8
+transport.tcpMux = true
+
+log.to = "console"
+log.level = "info"
