@@ -5,9 +5,10 @@
 设备本地控制台（devsrv.py）与局域网互联（mesh.py）都不依赖这两条通道。
 
 GitHub 通道的容错前提（国内网络经常连不上）：
-抓不到新规则时继续用本地缓存 rules.remote.json；支持镜像前缀（gh_proxy）；
-失败后指数退避到 gh_backoff_max_s 并加随机抖动；遇到速率限制或 403 自动拉长间隔；
-上报失败写入 spool.gh.jsonl，等网络恢复后补齐。
+候选 URL 来自镜像池 mirrors.py（内置清单取自用户自己的 GitLink 项目），
+按健康度排序逐个尝试；抓不到新规则时用本地缓存 rules.remote.json；
+失败指数退避到 gh_backoff_max_s 并加随机抖动；遇到速率限制自动拉长间隔；
+上报失败写 spool.gh.jsonl，恢复后补齐；后台定期探测镜像并重新排序。
 """
 from __future__ import annotations
 
@@ -20,12 +21,13 @@ import time
 from typing import Any, Awaitable, Callable
 
 from .config import Config
+from .mirrors import MirrorPool
 
 SEND_TIMEOUT = 20
 MAX_WS_SIZE = 48 * 1024 * 1024
 DEDUP_MAX = 800
 GH_BATCH = 25
-GH_FETCH_TIMEOUT = 20
+GH_FETCH_TIMEOUT = 15
 
 
 def _requests():
@@ -34,6 +36,11 @@ def _requests():
         return requests
     except Exception:
         return None
+
+
+def _bad_candidate(u: str) -> bool:
+    """排除“用 github.com 前缀拼接 raw/api 地址”这类无效组合。"""
+    return "github.com/https://" in u or "github.com/http://" in u
 
 
 class ControlChannel:
@@ -53,7 +60,9 @@ class ControlChannel:
         self._seen: dict[str, float] = {}
         self._gh_rule_ver = -1
         self.gh_fails = 0
-        self.gh_mirror_ok = False
+        self.last_mirror = ""
+        self.pool = MirrorPool(cfg.home_path, log, pool_json=cfg.gh_mirror_pool,
+                               top=cfg.gh_mirror_top)
         self.links: dict[str, dict[str, Any]] = {
             "ws": {"enabled": bool(cfg.server_url), "connected": False, "last_error": "", "fails": 0, "sent": 0, "recv": 0},
             "gh": {"enabled": bool(cfg.gh_rules_repo), "connected": False, "last_error": "", "fails": 0, "sent": 0, "recv": 0},
@@ -76,7 +85,8 @@ class ControlChannel:
     def status(self) -> dict:
         return {"ws": dict(self.links["ws"]), "gh": dict(self.links["gh"]),
                 "online": self.online, "gh_fails": self.gh_fails,
-                "gh_mirror": self.gh_mirror_ok, "spool": self._spool_size()}
+                "last_mirror": self.last_mirror, "spool": self._spool_size(),
+                "mirrors": self.pool.status()}
 
     def _spool_path(self, name: str):
         return self.cfg.home_path / f"spool.{name}.jsonl"
@@ -110,6 +120,8 @@ class ControlChannel:
             self.log.info("WebSocket 通道未配置（server_url 为空）")
         if self.links["gh"]["enabled"]:
             tasks.append(asyncio.create_task(self._gh_loop(), name="channel-gh"))
+            if self.cfg.gh_mirror_probe:
+                tasks.append(asyncio.create_task(self._gh_probe_loop(), name="channel-probe"))
         else:
             self.log.info("GitHub 通道未配置（gh_rules_repo 为空）")
         if not tasks:
@@ -186,35 +198,64 @@ class ControlChannel:
 
     def hello(self) -> dict[str, Any]:
         return {"type": "hello", "device_id": self.cfg.device_id, "name": self.cfg.device_name,
-                "group": self.cfg.group, "ver": "1.2.0", "devconsole": self.cfg.devconsole_url,
+                "group": self.cfg.group, "ver": "1.3.0", "devconsole": self.cfg.devconsole_url,
                 "mesh": {"group": self.cfg.mesh_scope, "port": int(self.cfg.mesh_port)},
+                "mirrors": self.pool.healthy(3),
                 "os": f"{platform.system()}-{platform.release()}", "host": platform.node(),
                 "caps": ["devconsole", "mesh", "desktop", "shell", "files", "capture", "scan", "git", "rules"],
                 "ts": int(time.time())}
 
-    # --- GitHub 通道（高容错） ---
-    def _gh_bases(self) -> list[str]:
-        prim = self.cfg.gh_raw_base.rstrip("/")
-        out = []
-        proxy = (self.cfg.gh_proxy or "").strip().rstrip("/")
-        if proxy:
-            if self.gh_mirror_ok:
-                out.append(f"{proxy}/{prim}")
-                out.append(prim)
-            else:
-                out.append(prim)
-                out.append(f"{proxy}/{prim}")
-        else:
-            out.append(prim)
-        return out
+    # --- GitHub 通道（镜像池 + 缓存 + 退避） ---
+    def _gh_try_urls(self, target: str) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        for mid, u in self.pool.candidates(target, prefer=self.cfg.gh_proxy):
+            if _bad_candidate(u):
+                continue
+            out.append((mid, u))
+        top = max(1, int(self.cfg.gh_mirror_top))
+        return out[:top] if out else [(self.cfg.gh_raw_base, target)]
+
+    def _gh_fetch_json(self, req, rel_path: str):
+        target = f"{self.cfg.gh_raw_base.rstrip('/')}/{rel_path}"
+        last = "网络不可达"
+        for mid, url in self._gh_try_urls(target):
+            t0 = time.time()
+            try:
+                r = req.get(url, headers=self._gh_headers(), timeout=GH_FETCH_TIMEOUT)
+            except Exception as e:
+                self.pool.report(mid, False)
+                last = str(e)
+                continue
+            lat = (time.time() - t0) * 1000.0
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                except Exception as e:
+                    self.pool.report(mid, False)
+                    last = f"JSON 解析失败 {e}"
+                    continue
+                self.pool.report(mid, True, lat)
+                self.last_mirror = mid
+                return data
+            self.pool.report(mid, False)
+            last = f"HTTP {r.status_code}"
+            if r.status_code == 403 and (r.headers.get("X-RateLimit-Remaining") == "0"):
+                last = "触发速率限制"
+        self.links["gh"]["last_error"] = last
+        return None
+
+    def _gh_headers(self) -> dict[str, str]:
+        h = {"Accept": "application/vnd.github+json", "User-Agent": "cloudctl-agent"}
+        if self.cfg.gh_token:
+            h["Authorization"] = f"Bearer {self.cfg.gh_token}"
+        return h
 
     async def _gh_loop(self) -> None:
         cfg = self.cfg
         repo = cfg.gh_rules_repo.strip("/")
-        if not cfg.gh_token:
-            self.log.warning("GitHub 通道未配置 gh_token，只能匿名读取，建议补上细粒度令牌")
-        self.log.info("GitHub 通道已启动，仓库 %s，轮询 %ss，镜像 %s",
-                      repo, cfg.gh_poll_s, cfg.gh_proxy or "无")
+        self.log.info("GitHub 通道已启动，仓库 %s，轮询 %ss，镜像池 %s 条（首选：%s）",
+                      repo, cfg.gh_poll_s, self.pool.status()["count"],
+                      (self.pool.status()["best"] or [{}])[0].get("id", "未知"))
         await self._gh_load_cache()
         while not self._stop.is_set():
             ok = False
@@ -232,7 +273,7 @@ class ControlChannel:
                 self.log.debug("GitHub 通道异常：%s", e)
             if ok:
                 if self.gh_fails:
-                    self.log.info("GitHub 通道恢复正常")
+                    self.log.info("GitHub 通道恢复正常（当前镜像 %s）", self.last_mirror or "直连")
                 self.gh_fails = 0
                 self.links["gh"].update({"connected": True, "last_error": "", "fails": 0})
                 await asyncio.sleep(max(10, cfg.gh_poll_s))
@@ -240,14 +281,45 @@ class ControlChannel:
                 self.gh_fails += 1
                 self.links["gh"].update({"connected": False, "fails": self.gh_fails})
                 if self.gh_fails in (1, 5) or self.gh_fails % 10 == 0:
-                    self.log.warning("GitHub 通道不可达（连续 %s 次）：%s；本地缓存规则仍生效",
-                                     self.gh_fails, self.links["gh"].get("last_error") or "网络不可达")
+                    self.log.warning("GitHub 通道不可达（连续 %s 次）：%s；已尝试镜像 %s；本地缓存规则仍生效",
+                                     self.gh_fails, self.links["gh"].get("last_error") or "网络不可达",
+                                     self.cfg.gh_mirror_top)
                 await asyncio.sleep(self._gh_delay())
 
     def _gh_delay(self) -> float:
         base = max(10, int(self.cfg.gh_poll_s))
         wait = min(float(self.cfg.gh_backoff_max_s), base * (2 ** min(self.gh_fails, 6)))
         return wait * (0.8 + random.random() * 0.4)
+
+    async def _gh_probe_loop(self) -> None:
+        interval = max(120, int(self.cfg.gh_mirror_probe_s))
+        await asyncio.sleep(20)
+        while not self._stop.is_set():
+            try:
+                await asyncio.to_thread(self._gh_probe_once)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.log.debug("镜像探测异常：%s", e)
+            await asyncio.sleep(interval)
+
+    def _gh_probe_once(self) -> None:
+        req = _requests()
+        repo = self.cfg.gh_rules_repo.strip("/")
+        if req is None or not repo:
+            return
+        probe_url = f"{self.cfg.gh_raw_base.rstrip('/')}/{repo}/main/{self.cfg.gh_rules_path}"
+
+        def _getter(url: str):
+            t0 = time.time()
+            try:
+                r = req.get(url, headers=self._gh_headers(), timeout=8)
+                ms = (time.time() - t0) * 1000.0
+                return (r.status_code == 200, ms, f"HTTP {r.status_code}")
+            except Exception as e:
+                return (False, 0.0, str(e)[:60])
+
+        self.pool.probe(_getter, probe_url, max_mirrors=12)
 
     async def _gh_poll_once(self, req, repo: str) -> bool:
         cfg = self.cfg
@@ -261,7 +333,7 @@ class ControlChannel:
                 self.links["gh"]["recv"] += 1
                 self._gh_write_cache(rules)
                 await self.on_rules(rules, ver)
-                self.log.info("GitHub 通道加载规则 version=%s", ver)
+                self.log.info("GitHub 通道加载规则 version=%s（来自 %s）", ver, self.last_mirror or "直连")
         payload = await asyncio.to_thread(
             self._gh_fetch_json, req, f"{repo}/main/{cfg.gh_cmd_dir}/{cfg.device_id}.json")
         if isinstance(payload, dict):
@@ -272,35 +344,6 @@ class ControlChannel:
         if touched:
             await self._gh_flush(req, repo)
         return touched
-
-    def _gh_fetch_json(self, req, rel_path: str):
-        last = ""
-        for base in self._gh_bases():
-            url = f"{base}/{rel_path}"
-            try:
-                r = req.get(url, headers=self._gh_headers(), timeout=GH_FETCH_TIMEOUT)
-            except Exception as e:
-                last = str(e)
-                continue
-            if r.status_code == 200:
-                if base != self.cfg.gh_raw_base.rstrip("/"):
-                    self.gh_mirror_ok = True
-                try:
-                    return r.json()
-                except Exception as e:
-                    last = f"JSON 解析失败 {e}"
-                    continue
-            last = f"HTTP {r.status_code}"
-            if r.status_code == 403 and (r.headers.get("X-RateLimit-Remaining") == "0"):
-                last = "触发速率限制"
-        self.links["gh"]["last_error"] = last or "网络不可达"
-        return None
-
-    def _gh_headers(self) -> dict[str, str]:
-        h = {"Accept": "application/vnd.github+json", "User-Agent": "cloudctl-agent"}
-        if self.cfg.gh_token:
-            h["Authorization"] = f"Bearer {self.cfg.gh_token}"
-        return h
 
     # --- 规则缓存：抓不到就用上一次的 ---
     async def _gh_load_cache(self) -> None:
@@ -322,6 +365,7 @@ class ControlChannel:
         except Exception:
             pass
 
+    # --- 结果上报 ---
     async def _gh_flush(self, req, repo: str) -> None:
         batch: list[dict] = []
         spool = self._spool_path("gh")
@@ -338,23 +382,18 @@ class ControlChannel:
         if not batch or not self.cfg.gh_token:
             return
         path = f"{self.cfg.gh_outbox_dir}/{self.cfg.device_id}.jsonl"
-        if await asyncio.to_thread(self._gh_append, req, repo, path, batch):
+        target = f"{self.cfg.gh_api_base.rstrip('/')}/repos/{repo}/contents/{path}"
+        if await asyncio.to_thread(self._gh_append, req, target, batch):
             self.links["gh"]["sent"] += len(batch)
         else:
             self._spool_append("gh", batch)
 
-    def _gh_append(self, req, repo: str, path: str, batch: list[dict]) -> bool:
-        prim = self.cfg.gh_api_base.rstrip("/")
-        bases = [prim]
-        proxy = (self.cfg.gh_proxy or "").strip().rstrip("/")
-        if proxy:
-            bases.append(f"{proxy}/{prim}")
-        for base in bases:
-            api = f"{base}/repos/{repo}/contents/{path}"
+    def _gh_append(self, req, target: str, batch: list[dict]) -> bool:
+        for mid, url in self._gh_try_urls(target):
             try:
                 sha = None
                 body = ""
-                g = req.get(api, headers=self._gh_headers(), timeout=GH_FETCH_TIMEOUT)
+                g = req.get(url, headers=self._gh_headers(), timeout=GH_FETCH_TIMEOUT)
                 if g.status_code == 200:
                     j = g.json()
                     sha = j.get("sha")
@@ -369,10 +408,13 @@ class ControlChannel:
                 }
                 if sha:
                     payload["sha"] = sha
-                r = req.put(api, headers=self._gh_headers(), json=payload, timeout=30)
+                r = req.put(url, headers=self._gh_headers(), json=payload, timeout=30)
                 if r.status_code in (200, 201):
+                    self.pool.report(mid, True)
                     return True
+                self.pool.report(mid, False)
             except Exception as e:
+                self.pool.report(mid, False)
                 self.log.debug("GitHub outbox 写入失败：%s", e)
         return False
 
