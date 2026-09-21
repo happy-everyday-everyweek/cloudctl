@@ -1,0 +1,27 @@
+name: deploy-hub
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['worker/**']
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 部署 Worker
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: worker/hub
+          command: deploy
+
+      - name: 提醒
+        run: |
+          echo "部署完成。若首次使用，请设置令牌："
+          echo "  wrangler secret put HUB_TOKEN --cwd worker/hub"
+          echo "然后把设备的 config.json 里 server_url 指向 Worker 域名。"
