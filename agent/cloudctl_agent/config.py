@@ -2,6 +2,9 @@
 
 配置优先级：环境变量 > config.json > 默认值。
 默认工作目录：Windows 为 %ProgramData%\\cloudctl，其他平台为 ~/.cloudctl。
+
+架构要点：每台实例自带本地服务（devsrv），本机浏览器即可管理自己；
+WebSocket 与 GitHub 两条外联通道平行对等，都不是本地控制台的前提。
 """
 from __future__ import annotations
 
@@ -31,14 +34,21 @@ class Config:
     device_name: str = ""
     group: str = "default"
 
-    # 主通道：内网穿透暴露的 WebSocket 地址
+    # 设备本地服务：自带控制台 + HTTP API
+    devsrv_enabled: bool = True
+    devsrv_bind: str = "127.0.0.1"      # 局域网用 0.0.0.0
+    devsrv_port: int = 8788
+    devsrv_token: str = ""              # 留空则回退 server_token，再回退 device_id
+    devsrv_public_url: str = ""         # 隧道/反代后的外部地址，仅用于展示
+
+    # 通道一：WebSocket（内网穿透）
     server_url: str = ""
     server_token: str = ""
     reconnect_min_s: int = 3
     reconnect_max_s: int = 60
     heartbeat_s: int = 25
 
-    # 备用通道：GitHub 仓库文件轮询
+    # 通道二：GitHub 仓库文件轮询（与通道一同级，不是备胎）
     gh_rules_repo: str = ""            # owner/repo
     gh_rules_path: str = "ctl/rules.json"
     gh_cmd_dir: str = "ctl/cmd"        # 每个设备一个文件 <device_id>.json
@@ -102,6 +112,21 @@ class Config:
         p.mkdir(parents=True, exist_ok=True)
         return p
 
+    # --- 本地控制台 ---
+    @property
+    def devsrv_secret(self) -> str:
+        return self.devsrv_token or self.server_token or self.device_id
+
+    @property
+    def devconsole_url(self) -> str:
+        base = (self.devsrv_public_url or "").strip().rstrip("/")
+        if base:
+            return base
+        host = self.devsrv_bind or "127.0.0.1"
+        if host in ("0.0.0.0", "::", "*"):
+            host = "127.0.0.1"
+        return f"http://{host}:{int(self.devsrv_port)}"
+
     # --- 读写 ---
     @classmethod
     def path(cls) -> Path:
@@ -145,7 +170,8 @@ class Config:
     def public(self) -> dict[str, Any]:
         """去掉凭据的副本，用于上报。"""
         d = asdict(self)
-        for k in ("server_token", "gh_token", "upload_token"):
+        for k in ("server_token", "gh_token", "upload_token", "devsrv_token"):
             if d.get(k):
                 d[k] = "***"
+        d["devconsole"] = self.devconsole_url
         return d
