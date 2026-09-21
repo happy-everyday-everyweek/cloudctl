@@ -5,10 +5,14 @@ Pillow>=10.0
 mss>=9.0.1
 psutil>=5.9
 
-# 采集与输入（可用则启用，缺了会降级）
+# 采集与输入（可用则启用，缺了会自动降级）
 opencv-python>=4.8
 numpy>=1.24
 pynput>=1.7
+
+# 声控触发：麦克风电平监测，缺了会退化为周期录制
+# Windows 下 pip install sounddevice 会自动装 PortAudio
+sounddevice>=0.4.6
 
 # 打包
 pyinstaller>=6.0
