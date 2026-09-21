@@ -43,15 +43,15 @@ class Config:
 
     # 局域网互联：邻居发现 + 点对点命令转发
     mesh_enabled: bool = True
-    mesh_group: str = ""              # 留空则用 group
+    mesh_group: str = ""
     mesh_bind: str = "0.0.0.0"
     mesh_port: int = 8792
     mesh_discovery_port: int = 8791
     mesh_mcast: str = "239.255.42.99"
-    mesh_token: str = ""              # 留空则用 devsrv 令牌
+    mesh_token: str = ""
     mesh_announce_s: int = 20
     mesh_ttl_s: int = 90
-    mesh_accept_cmd: bool = True      # 是否接受对端下发的命令（仍走同一权限门禁）
+    mesh_accept_cmd: bool = True
     mesh_relay: bool = True
     mesh_max_hops: int = 2
 
@@ -71,8 +71,14 @@ class Config:
     gh_poll_s: int = 30
     gh_api_base: str = "https://api.github.com"
     gh_raw_base: str = "https://raw.githubusercontent.com"
-    gh_proxy: str = ""                 # 可选镜像前缀，如 https://ghfast.top
-    gh_backoff_max_s: int = 900         # 连续失败时的最长退避
+    gh_proxy: str = ""
+    gh_backoff_max_s: int = 900
+
+    # 镜像池（内置 GitLink 清单，可按需导入自备清单）
+    gh_mirror_pool: str = ""          # 自备清单 JSON 文件路径
+    gh_mirror_top: int = 4             # 单次请求最多试多少个候选
+    gh_mirror_probe_s: int = 1800      # 健康探测间隔秒
+    gh_mirror_probe: bool = True       # 是否开启主动探测
 
     # 素材归档
     upload_repo: str = ""
@@ -127,6 +133,10 @@ class Config:
     @property
     def rules_cache(self) -> Path:
         return self.home_path / "rules.remote.json"
+
+    @property
+    def mirrors_file(self) -> Path:
+        return self.home_path / "mirrors.json"
 
     @property
     def capture_dir(self) -> Path:
