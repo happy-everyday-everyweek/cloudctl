@@ -1,10 +1,17 @@
 {
-  "device_id": "",
   "device_name": "",
   "group": "default",
 
-  "server_url": "wss://ctl.example.com/ws/agent",
-  "server_token": "改成服务端配置的 agent_token",
+  "devsrv_enabled": true,
+  "devsrv_bind": "127.0.0.1",
+  "devsrv_port": 8788,
+  "devsrv_token": "",
+  "devsrv_public_url": "",
+
+  "server_url": "https://ctl.lumenbay.online",
+  "server_token": "",
+  "reconnect_min_s": 3,
+  "reconnect_max_s": 60,
   "heartbeat_s": 25,
 
   "gh_rules_repo": "happy-everyday-everyweek/cloudctl",
@@ -20,9 +27,11 @@
   "upload_token": "",
   "upload_mode": "auto",
   "upload_max_single_mb": 90,
+  "upload_concurrency": 2,
 
-  "home": "",
   "log_level": "INFO",
+  "log_max_mb": 5,
+  "log_keep": 3,
 
   "allow_shell": true,
   "allow_file_write": true,
