@@ -36,15 +36,28 @@ jobs:
         working-directory: agent
         run: dir cloudctl_agent\devstatic
 
+      - name: 生成 sha256 校验文件
+        id: sha
+        working-directory: agent
+        run: powershell -NoProfile -Command "$h=(Get-FileHash dist/cloudctl-agent.exe -Algorithm SHA256).Hash.ToLower(); Set-Content -Path dist/cloudctl-agent.exe.sha256 -Value $h; Write-Output ('sha256=' + $h) | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8"
+
       - uses: actions/upload-artifact@v4
         with:
           name: cloudctl-agent-windows
-          path: agent/dist/cloudctl-agent.exe
+          path: |
+            agent/dist/cloudctl-agent.exe
+            agent/dist/cloudctl-agent.exe.sha256
           if-no-files-found: error
 
       - name: 打 Tag 时发布 Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: agent/dist/cloudctl-agent.exe
+          files: |
+            agent/dist/cloudctl-agent.exe
+            agent/dist/cloudctl-agent.exe.sha256
           generate_release_notes: true
+          body: |
+            cloudctl-agent ${{ github.ref_name }}
+            自升级资产：cloudctl-agent.exe 与 cloudctl-agent.exe.sha256（sha256: ${{ steps.sha.outputs.sha256 }}）
+            设备侧开 OTA：rules.update.enabled=true，可配 channel/tag、verify_sha、auto_apply。
