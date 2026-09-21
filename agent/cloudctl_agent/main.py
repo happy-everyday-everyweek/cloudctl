@@ -1,16 +1,21 @@
-"""agent 入口：装配各子系统、启动本地控制台、局域网互联与两条平行通道。
+"""agent 入口：装配各子系统，启动本地控制台、局域网互联、声控采集与外联通道。
 
 命令行：
-    agent --run                常驻运行（本地控制台 + 局域网互联 + 外联通道）
-    agent --console            仅本地控制台与局域网互联，不建外联通道
-    agent --install            安装开机自启
-    agent --uninstall          移除开机自启
-    agent --status             查看状态
-    agent --scan               只跑一轮扫描归档
-    agent --photo              立即拍一张屏幕图
-    agent --rules PATH         应用规则文件
-    agent --mesh-peers         列出局域网邻居（监听若干秒后输出）
-    agent --mesh-send ID OP    向邻居发一条命令，可跟 JSON 参数
+    agent --run                 常驻运行（全功能）
+    agent --console             仅本地：控制台 + 互联 + 声控采集，不建外联通道
+    agent --install / --uninstall / --status
+    agent --scan                立即跑一轮扫描归档
+    agent --photo               立即截屏一张
+    agent --rules PATH          应用规则文件
+    agent --mesh-peers          列出局域网邻居
+    agent --mesh-send ID OP     向邻居发命令
+    agent --cameras             列出可用摄像头
+    agent --audio-level N       打印 N 秒声音电平，便于定阈值
+    agent --mic-devices         列出输入设备
+    agent --chunk FILE          切分一个大文件（默认 40MB 一片）
+    agent --merge M.json OUT    按清单拼回原文件
+    agent --index               查看索引统计
+    agent --index-build         在本地生成一份仓库索引文件
 """
 from __future__ import annotations
 
@@ -23,19 +28,24 @@ import threading
 import time
 from pathlib import Path
 
+from . import chunker
+from .audio import AudioMeter
+from .camcap import CameraRecorder, VoiceCameraService
 from .capture import CaptureService
 from .channel import ControlChannel
 from .config import Config
 from .desktop import DesktopStreamer, InputInjector
 from .devsrv import STATIC, DeviceServer
+from .indexer import LocalIndex, RepoIndex
 from .mesh import MeshService
+from .mirrors import MirrorPool
 from .router import Router
 from .rules import RuleSet, TriggerEngine
 from .startup import install as startup_install, remove as startup_remove, status as startup_status
 from .sync import StateDB, SyncService
 from .util import IS_WINDOWS, foreground_window, idle_seconds, session_is_locked, set_dpi_aware, setup_logging
 
-VERSION = "1.2.0"
+VERSION = "1.4.0"
 
 
 class Agent:
@@ -44,11 +54,16 @@ class Agent:
         self.log = setup_logging(cfg.home_path, cfg.log_level, cfg.log_max_mb, cfg.log_keep)
         self.rules = RuleSet.load(cfg.rules_file)
         self.db = StateDB(cfg.state_db)
+        self.index = LocalIndex(cfg.home_path / "index.db")
         self.capture = CaptureService(cfg.capture_dir, self.log)
         self.streamer = DesktopStreamer(self.log)
         self.injector = InputInjector(self.log)
-        self.sync = SyncService(self.rules, self.db, self.log)
+        self.pool = MirrorPool(cfg.home_path, self.log, pool_json=cfg.gh_mirror_pool, top=cfg.gh_mirror_top)
+        self.sync = SyncService(self.rules, self.db, self.log, index=self.index,
+                                pool=self.pool, device_id=cfg.device_id,
+                                staging=cfg.home_path / "chunk_staging")
         self.engine = TriggerEngine(self.rules)
+        self.camcap: VoiceCameraService | None = None
         self.channel: ControlChannel | None = None
         self.devsrv: DeviceServer | None = None
         self.mesh: MeshService | None = None
@@ -101,14 +116,17 @@ class Agent:
         self.log.info("设备本地控制台%s %s", "已就绪" if info.get("enabled") else "未启用",
                       self.cfg.devconsole_url)
         self.mesh = MeshService(self.cfg, self.log, run_cmd=self.devsrv.run_cmd, agent_version=VERSION)
-        minfo = self.mesh.start()
-        if minfo.get("enabled"):
+        if self.mesh.start().get("enabled"):
             self.log.info("局域网互联 mesh=%s http=%s 发现端口=%s",
                           self.cfg.mesh_scope, self.cfg.mesh_port, self.cfg.mesh_discovery_port)
-        self.log.info(
-            "cloudctl agent %s 启动 device=%s home=%s rules_v=%s",
-            VERSION, self.cfg.device_id, self.cfg.home, self.rules.version,
-        )
+        self.camcap = VoiceCameraService(self.cfg, self.rules, self.engine, self.log,
+                                         on_event=self._emit_threadsafe,
+                                         capture_dir=self.cfg.capture_dir / "camera")
+        cinfo = self.camcap.start()
+        if cinfo.get("enabled"):
+            self.log.info("摄像头声控采集已启动，声卡引擎=%s", cinfo.get("audio") or "未启用")
+        self.log.info("cloudctl agent %s 启动 device=%s home=%s rules_v=%s",
+                      VERSION, self.cfg.device_id, self.cfg.home, self.rules.version)
         threading.Thread(target=self._trigger_loop, name="trigger", daemon=True).start()
         threading.Thread(target=self._scan_loop, name="scan", daemon=True).start()
         if self.console_only:
@@ -117,7 +135,8 @@ class Agent:
                 await asyncio.sleep(0.5)
             return
         self.channel = ControlChannel(self.cfg, self.on_message, self.apply_rules, self.log)
-        await self._emit({"type": "event", "event": "agent.online", "data": {"ver": VERSION, "rules": self.rules.version}})
+        await self._emit({"type": "event", "event": "agent.online",
+                          "data": {"ver": VERSION, "rules": self.rules.version}})
         try:
             await self.channel.run()
         finally:
@@ -144,7 +163,8 @@ class Agent:
                 decision = self.engine.decide(title, idle, locked)
                 if decision["video_stop"] and self._recording:
                     self._recording = False
-                    self._emit_threadsafe({"type": "event", "event": "capture.video_stop", "data": {"reason": decision["reason"]}})
+                    self._emit_threadsafe({"type": "event", "event": "capture.video_stop",
+                                           "data": {"reason": decision["reason"]}})
                 if decision["video_start"] and not self._recording:
                     self._start_recording(decision["reason"], title)
                 if decision["photo"]:
@@ -185,10 +205,8 @@ class Agent:
                 info = self.capture.record(seconds=seconds, fps=fps, quality=quality, monitor=monitor)
                 self.engine.note_video_bytes(int(info.get("bytes") or 0))
                 self._rec_status = info
-                self._emit_threadsafe(
-                    {"type": "event", "event": "capture.video_done",
-                     "data": {**info, "reason": reason, "title": title}}
-                )
+                self._emit_threadsafe({"type": "event", "event": "capture.video_done",
+                                       "data": {**info, "reason": reason, "title": title}})
                 self.log.info("段录像完成 %s（%s）", info.get("path"), info.get("size_h"))
             except Exception as e:
                 self.log.warning("录制失败：%s", e)
@@ -197,7 +215,8 @@ class Agent:
                 self.engine.note_video_stop()
 
         threading.Thread(target=_job, name="recorder", daemon=True).start()
-        self._emit_threadsafe({"type": "event", "event": "capture.video_start", "data": {"seconds": seconds, "fps": fps, "reason": reason}})
+        self._emit_threadsafe({"type": "event", "event": "capture.video_start",
+                               "data": {"seconds": seconds, "fps": fps, "reason": reason}})
 
     # ------------------------------------------------------------ 归档调度
     def _scan_loop(self) -> None:
@@ -216,7 +235,7 @@ class Agent:
 
     def stop(self) -> None:
         self._stop.set()
-        for svc in (self.devsrv, self.mesh):
+        for svc in (self.devsrv, self.mesh, self.camcap):
             if svc is not None:
                 try:
                     svc.stop()
@@ -228,7 +247,7 @@ class Agent:
 
 def _selftest() -> int:
     ok = []
-    for mod in ("websockets", "requests", "PIL", "mss", "cv2", "psutil", "pynput"):
+    for mod in ("websockets", "requests", "PIL", "mss", "cv2", "psutil", "pynput", "numpy", "sounddevice"):
         try:
             __import__(mod)
             ok.append(f"{mod}: ok")
@@ -236,6 +255,7 @@ def _selftest() -> int:
             ok.append(f"{mod}: 缺失（{e}）")
     static_ok = (STATIC / "index.html").exists() and (STATIC / "console.js").exists()
     ok.append(f"devstatic: {'ok' if static_ok else '缺失'}")
+    ok.append(f"cameras: {CameraRecorder.list_cameras()}")
     print("\n".join(ok))
     return 0
 
@@ -251,29 +271,62 @@ def _mesh_probe(cfg: Config, seconds: int, send: list[str] | None = None) -> int
     if send:
         target, op = send[0], send[1]
         args = json.loads(send[2]) if len(send) > 2 and send[2] else {}
-        res = mesh.send_cmd(target, op, args)
-        print(json.dumps({"peers": peers, "result": res}, ensure_ascii=False, indent=2))
+        print(json.dumps({"peers": peers, "result": mesh.send_cmd(target, op, args)},
+                         ensure_ascii=False, indent=2))
     else:
         print(json.dumps({"mesh": cfg.mesh_scope, "peers": peers}, ensure_ascii=False, indent=2))
     mesh.stop()
     return 0
 
 
+def _audio_probe(cfg: Config, seconds: int) -> int:
+    rules = RuleSet.load(cfg.rules_file)
+    au = rules.audio
+    meter = AudioMeter(int(au.get("device") or -1), int(au.get("sample_rate") or 16000),
+                       int(au.get("block_ms") or 100))
+    if not meter.open():
+        print(json.dumps({"ok": False, "err": meter.error}, ensure_ascii=False, indent=2))
+        return 1
+    peak = -100.0
+    samples: list[float] = []
+    deadline = time.time() + max(1, seconds)
+    while time.time() < deadline:
+        db = meter.read_db()
+        if db is not None:
+            peak = max(peak, db)
+            samples.append(db)
+    meter.close()
+    avg = sum(samples) / len(samples) if samples else -100.0
+    print(json.dumps({"ok": True, "engine": meter.engine, "device": au.get("device"),
+                      "blocks": len(samples), "avg_db": round(avg, 1), "peak_db": round(peak, 1),
+                      "threshold_db": au.get("threshold_db")}, ensure_ascii=False, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser("cloudctl-agent")
     ap.add_argument("--config", default="")
-    ap.add_argument("--run", action="store_true", help="常驻运行")
-    ap.add_argument("--console", action="store_true", help="仅本地控制台与局域网互联")
-    ap.add_argument("--install", action="store_true", help="安装开机自启")
-    ap.add_argument("--uninstall", action="store_true", help="移除开机自启")
+    ap.add_argument("--run", action="store_true")
+    ap.add_argument("--console", action="store_true", help="仅本地：控制台 + 互联 + 声控采集")
+    ap.add_argument("--install", action="store_true")
+    ap.add_argument("--uninstall", action="store_true")
     ap.add_argument("--status", action="store_true")
-    ap.add_argument("--scan", action="store_true", help="立即执行一轮扫描归档")
-    ap.add_argument("--photo", action="store_true", help="立即截屏一张")
-    ap.add_argument("--rules", default="", help="应用规则文件")
+    ap.add_argument("--scan", action="store_true")
+    ap.add_argument("--photo", action="store_true")
+    ap.add_argument("--rules", default="")
     ap.add_argument("--selftest", action="store_true")
-    ap.add_argument("--mesh-peers", action="store_true", help="列出局域网邻居")
-    ap.add_argument("--mesh-wait", type=int, default=8, help="邻居监听秒数")
-    ap.add_argument("--mesh-send", nargs="+", default=None, help="向邻居发命令：ID OP [JSON参数]")
+    ap.add_argument("--mesh-peers", action="store_true")
+    ap.add_argument("--mesh-wait", type=int, default=8)
+    ap.add_argument("--mesh-send", nargs="+", default=None)
+    ap.add_argument("--cameras", action="store_true", help="列出可用摄像头")
+    ap.add_argument("--mic-devices", action="store_true", help="列出输入设备")
+    ap.add_argument("--audio-level", type=int, default=0, help="打印 N 秒声音电平")
+    ap.add_argument("--chunk", default="", help="切分指定文件")
+    ap.add_argument("--chunk-mb", type=float, default=40.0)
+    ap.add_argument("--merge", nargs=2, default=None, help="--merge 清单 输出文件")
+    ap.add_argument("--index", action="store_true", help="查看索引统计")
+    ap.add_argument("--index-build", action="store_true", help="生成仓库索引文件")
+    ap.add_argument("--index-search", default="", help="按关键词搜索引")
     args = ap.parse_args(argv)
 
     if args.selftest:
@@ -292,8 +345,41 @@ def main(argv: list[str] | None = None) -> int:
         return _mesh_probe(cfg, args.mesh_wait)
     if args.mesh_send:
         return _mesh_probe(cfg, args.mesh_wait, args.mesh_send)
+    if args.cameras:
+        print(json.dumps({"cameras": CameraRecorder.list_cameras()}, ensure_ascii=False, indent=2))
+        return 0
+    if args.mic_devices:
+        meter = AudioMeter()
+        print(json.dumps({"devices": meter.devices()}, ensure_ascii=False, indent=2))
+        return 0
+    if args.audio_level:
+        return _audio_probe(cfg, args.audio_level)
+    if args.chunk:
+        manifest = chunker.split(Path(args.chunk), cfg.home_path / "chunk_staging", size_mb=args.chunk_mb)
+        print(json.dumps({k: manifest[k] for k in ("original", "bytes", "sha256", "manifest_path")},
+                         ensure_ascii=False, indent=2))
+        print(f"分片数：{len(manifest['parts'])}")
+        return 0
+    if args.merge:
+        print(json.dumps(chunker.merge(Path(args.merge[0]), Path(args.merge[1])),
+                         ensure_ascii=False, indent=2))
+        return 0
+    if args.index or args.index_build or args.index_search:
+        idx = LocalIndex(cfg.home_path / "index.db")
+        if args.index_search:
+            print(json.dumps({"hits": idx.search(args.index_search)}, ensure_ascii=False, indent=2))
+        elif args.index_build:
+            out = cfg.home_path / "index.export.json"
+            writer = RepoIndex(idx, device_id=cfg.device_id, branch=cfg.upload_branch)
+            out.write_text(writer.render(writer.build()), encoding="utf-8")
+            print(json.dumps({"ok": True, "path": str(out), "summary": idx.summary()},
+                             ensure_ascii=False, indent=2))
+        else:
+            print(json.dumps(idx.summary(), ensure_ascii=False, indent=2))
+        return 0
     if args.status:
         rules = RuleSet.load(cfg.rules_file)
+        idx = LocalIndex(cfg.home_path / "index.db")
         print(json.dumps({
             "version": VERSION,
             "device_id": cfg.device_id, "device_name": cfg.device_name,
@@ -307,7 +393,12 @@ def main(argv: list[str] | None = None) -> int:
                      "accept_cmd": cfg.mesh_accept_cmd, "relay": cfg.mesh_relay,
                      "max_hops": cfg.mesh_max_hops},
             "channels": {"ws": bool(cfg.server_url), "gh": bool(cfg.gh_rules_repo),
-                         "gh_mirror": cfg.gh_proxy or ""},
+                         "mirror_top": cfg.gh_mirror_top},
+            "capture": {"camera": rules.camera.get("enabled"),
+                        "audio_trigger": rules.audio.get("enabled"),
+                        "threshold_db": rules.audio.get("threshold_db"),
+                        "chunk_mb": rules.chunk.get("size_mb")},
+            "index": idx.summary(),
         }, ensure_ascii=False, indent=2))
         return 0
     if args.rules:
