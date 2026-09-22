@@ -1,10 +1,9 @@
 """配置加载：config.json + 环境变量覆盖。
 
-配置优先级：环境变量 > config.json > 默认值。
-默认工作目录：Windows 为 %ProgramData%\\cloudctl，其他平台为 ~/.cloudctl。
+优先级：环境变量 > config.json > 默认值。默认工作目录：Windows 为 %ProgramData%\\cloudctl。
 
-三类入口：设备本地控制台（devsrv）、两条平行外联通道（WS / GitHub）、
-局域网对等互联（mesh）。任何一类失效都不影响其余两类。
+三类入口：设备本地控制台（devsrv）、两条平行外联通道（WS / GitHub）、局域网互联（mesh）。
+新增：存活上报与关机上报（report）。
 """
 from __future__ import annotations
 
@@ -34,14 +33,14 @@ class Config:
     device_name: str = ""
     group: str = "default"
 
-    # 设备本地服务：自带控制台 + HTTP API
+    # 设备本地服务
     devsrv_enabled: bool = True
     devsrv_bind: str = "127.0.0.1"
     devsrv_port: int = 8788
     devsrv_token: str = ""
     devsrv_public_url: str = ""
 
-    # 局域网互联：邻居发现 + 点对点命令转发
+    # 局域网互联
     mesh_enabled: bool = True
     mesh_group: str = ""
     mesh_bind: str = "0.0.0.0"
@@ -55,14 +54,14 @@ class Config:
     mesh_relay: bool = True
     mesh_max_hops: int = 2
 
-    # 通道一：WebSocket（内网穿透）
+    # 通道一：WebSocket
     server_url: str = ""
     server_token: str = ""
     reconnect_min_s: int = 3
     reconnect_max_s: int = 60
     heartbeat_s: int = 25
 
-    # 通道二：GitHub 仓库文件轮询（与通道一同级，不是备胎）
+    # 通道二：GitHub 文件轮询
     gh_rules_repo: str = ""
     gh_rules_path: str = "ctl/rules.json"
     gh_cmd_dir: str = "ctl/cmd"
@@ -74,11 +73,19 @@ class Config:
     gh_proxy: str = ""
     gh_backoff_max_s: int = 900
 
-    # 镜像池（内置 GitLink 清单，可按需导入自备清单）
-    gh_mirror_pool: str = ""          # 自备清单 JSON 文件路径
-    gh_mirror_top: int = 4             # 单次请求最多试多少个候选
-    gh_mirror_probe_s: int = 1800      # 健康探测间隔秒
-    gh_mirror_probe: bool = True       # 是否开启主动探测
+    # 镜像池
+    gh_mirror_pool: str = ""
+    gh_mirror_top: int = 4
+    gh_mirror_probe_s: int = 1800
+    gh_mirror_probe: bool = True
+
+    # 上报：存活心跳与关机上报
+    report_enabled: bool = True
+    report_interval_s: int = 300          # 存活上报间隔
+    report_on_start: bool = True
+    report_on_shutdown: bool = True
+    report_shutdown_wait_s: int = 8        # 关机上报最多等多久（同步发送）
+    report_include_metrics: bool = True    # 带 CPU / 内存占用
 
     # 素材归档
     upload_repo: str = ""
@@ -95,7 +102,7 @@ class Config:
     log_max_mb: int = 5
     log_keep: int = 3
 
-    # 运行开关（服务端规则只能收紧，不能放开）
+    # 运行开关（服务端规则只能收紧）
     allow_shell: bool = True
     allow_file_write: bool = True
     allow_delete: bool = False
@@ -144,18 +151,31 @@ class Config:
         p.mkdir(parents=True, exist_ok=True)
         return p
 
-    # --- 本地控制台与互联 ---
+    # --- 令牌与安全 ---
     @property
     def devsrv_secret(self) -> str:
         return self.devsrv_token or self.server_token or self.device_id
+
+    @property
+    def devsrv_has_explicit_token(self) -> bool:
+        """是否配了真正的令牌（没配时只能绑回环地址）。"""
+        return bool(self.devsrv_token or self.server_token)
 
     @property
     def mesh_secret(self) -> str:
         return self.mesh_token or self.devsrv_secret
 
     @property
+    def mesh_has_explicit_token(self) -> bool:
+        return bool(self.mesh_token or self.devsrv_token or self.server_token)
+
+    @property
     def mesh_scope(self) -> str:
         return self.mesh_group or self.group or "default"
+
+    @property
+    def is_loopback(self) -> bool:
+        return (self.devsrv_bind or "127.0.0.1") in ("127.0.0.1", "localhost", "::1")
 
     @property
     def devconsole_url(self) -> str:
@@ -208,7 +228,6 @@ class Config:
         p.write_text(json.dumps(asdict(self), indent=2, ensure_ascii=False), encoding="utf-8")
 
     def public(self) -> dict[str, Any]:
-        """去掉凭据的副本，用于上报。"""
         d = asdict(self)
         for k in ("server_token", "gh_token", "upload_token", "devsrv_token", "mesh_token"):
             if d.get(k):
