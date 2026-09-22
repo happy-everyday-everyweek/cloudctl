@@ -1,15 +1,13 @@
 """设备本地服务：控制台 + HTTP API + 桌面流。
 
-设计要点：每台实例自己监听一个端口，本机浏览器直接就能管自己，
-不依赖中心服务端是否在线。默认只绑 127.0.0.1；需要局域网或隧道
-可达时把 devsrv_bind 改成 0.0.0.0。
-
-只用标准库实现，不引入额外依赖，方便打进单文件 exe。
+安全修复：以前只要没配令牌，令牌会回退到 device_id（可枚举），而绑定地址可以改成 0.0.0.0，
+相当于把一个公开端口暴露出去。现在规定：绑定非回环地址（0.0.0.0 / 局域网 IP）时，
+必须显式配置 devsrv_token 或 server_token，否则拒绝启动并写入错误日志。
+默认仍只绑 127.0.0.1。
 """
 from __future__ import annotations
 
 import asyncio
-import base64
 import hmac
 import io
 import json
@@ -22,24 +20,18 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import ops
-from .util import human_size
 
 STATIC = Path(__file__).resolve().parent / "devstatic"
 BOUNDARY = "cloudctlframe"
+LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 
 
 class DeviceServer:
-    def __init__(
-        self,
-        cfg,
-        rules,
-        capture,
-        injector,
-        sync,
-        log,
-        get_router: Callable[[], Any] = lambda: None,
-        get_loop: Callable[[], Any] = lambda: None,
-    ) -> None:
+    def __init__(self, cfg, rules, capture, injector, sync, log,
+                 get_router: Callable[[], Any] = lambda: None,
+                 get_loop: Callable[[], Any] = lambda: None,
+                 on_report: Callable[[], dict] | None = None,
+                 agent_version: str = "0.0.0") -> None:
         self.cfg = cfg
         self.rules = rules
         self.capture = capture
@@ -48,7 +40,10 @@ class DeviceServer:
         self.log = log
         self.get_router = get_router
         self.get_loop = get_loop
-        self.token = cfg.devsrv_token or cfg.server_token or cfg.device_id
+        self.on_report = on_report
+        self.version = agent_version
+        self.token = cfg.devsrv_secret
+        self.explicit_token = bool(cfg.devsrv_has_explicit_token)
         self.httpd: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
         self.started_ts = 0.0
@@ -62,13 +57,19 @@ class DeviceServer:
         if self.httpd is not None:
             return {"enabled": True, "already": True}
         host = self.cfg.devsrv_bind or "127.0.0.1"
+        if host not in LOOPBACK and not self.explicit_token:
+            msg = (f"拒绝启动：绑定到 {host} 但未配置 devsrv_token/server_token。"
+                   "开放到局域网或公网前必须先设令牌。")
+            self.log.error(msg)
+            return {"enabled": False, "err": msg}
         handler = _make_handler(self)
         self.httpd = ThreadingHTTPServer((host, int(self.cfg.devsrv_port)), handler)
         self.httpd.daemon_threads = True
         self.started_ts = time.time()
         self.thread = threading.Thread(target=self.httpd.serve_forever, name="devsrv", daemon=True)
         self.thread.start()
-        self.log.info("设备本地服务已监听 http://%s:%s", host, self.cfg.devsrv_port)
+        self.log.info("设备本地服务已监听 http://%s:%s（%s）", host, self.cfg.devsrv_port,
+                      "带令牌" if self.explicit_token else "仅本机、无显式令牌")
         return {"enabled": True, "url": f"http://{host}:{self.cfg.devsrv_port}"}
 
     def stop(self) -> dict:
@@ -91,18 +92,18 @@ class DeviceServer:
             "uptime_s": int(time.time() - self.started_ts) if self.started_ts else 0,
             "requests": self.requests,
             "errors": self.errors,
-            "auth": "token" if self.token else "none",
+            "auth": "token" if self.explicit_token else "local-only",
+            "version": self.version,
         }
 
     # ------------------------------------------------------------ 鉴权
     def check_token(self, got: str) -> bool:
         if not self.token:
-            return True
+            return False
         return hmac.compare_digest(str(got or ""), str(self.token))
 
     # ------------------------------------------------------------ 能力
     def run_cmd(self, op: str, args: dict, timeout: float = 120.0) -> dict:
-        """优先走 Router（带权限门禁与审计）；尚未启动时降级直接调 ops。"""
         router = self.get_router()
         loop = self.get_loop()
         if router is not None and loop is not None and loop.is_running():
@@ -113,10 +114,9 @@ class DeviceServer:
 
     def _fallback(self, op: str, args: dict) -> dict:
         try:
+            data: Any
             if op == "agent.info":
-                data = {"device_id": self.cfg.device_id, "device_name": self.cfg.device_name,
-                        "rules_version": self.rules.version, "devserver": self.status(),
-                        "db": self.sync.db.summary()}
+                data = self.info()
             elif op == "sys.info":
                 data = ops.sys_info()
             elif op == "file.list":
@@ -130,12 +130,29 @@ class DeviceServer:
         except Exception as e:
             return {"type": "result", "ok": False, "err": str(e)}
 
-    def snapshot(self, quality: int = 60, monitor: int = 0) -> bytes:
-        img = self.capture.ScreenSource(monitor).grab() if hasattr(self.capture, "ScreenSource") else None
-        if img is None:
-            from .capture import ScreenSource
+    def info(self) -> dict:
+        """agent.info 的唯一组装点，避免与 Router 各写一份。"""
+        idx = getattr(self.sync, "index", None)
+        return {"device_id": self.cfg.device_id, "device_name": self.cfg.device_name,
+                "version": self.version, "rules_version": self.rules.version,
+                "devserver": self.status(),
+                "capture": {"camera": self.rules.camera.get("enabled"),
+                            "audio_trigger": self.rules.audio.get("enabled"),
+                            "threshold_db": self.rules.audio.get("threshold_db")},
+                "report": self.rules.report,
+                "update": self.rules.update,
+                "db": self.sync.db.summary(),
+                "index": idx.summary() if idx is not None else {}}
 
-            img = ScreenSource(monitor).grab()
+    def report_now(self) -> dict:
+        if self.on_report is None:
+            return {"ok": False, "err": "未装配上报入口"}
+        return self.on_report()
+
+    def snapshot(self, quality: int = 60, monitor: int = 0) -> bytes:
+        from .capture import ScreenSource
+
+        img = ScreenSource(monitor).grab()
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=int(quality))
         return buf.getvalue()
@@ -150,7 +167,6 @@ class _Handler(BaseHTTPRequestHandler):
         self.dev: DeviceServer = kw.pop("_dev")
         super().__init__(*a, **kw)
 
-    # --- 工具 ---
     def log_message(self, fmt: str, *args) -> None:
         return
 
@@ -171,8 +187,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
 
     def _token_ok(self, q: dict) -> bool:
-        got = (self.headers.get("X-Token") or q.get("token", [""])[0]
-               or self._cookie_token())
+        got = (self.headers.get("X-Token") or q.get("token", [""])[0] or self._cookie_token())
         return self.dev.check_token(got)
 
     def _cookie_token(self) -> str:
@@ -216,9 +231,11 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/dev/status":
                 return self._json({"ok": True, "data": self.dev.status()})
             if path == "/api/dev/info":
-                return self._json(self.dev.run_cmd("agent.info", {}, 30))
+                return self._json({"ok": True, "data": self.dev.info()})
             if path == "/api/dev/log":
                 return self._json({"ok": True, "data": self._tail(int(q.get("lines", ["200"])[0]))})
+            if path == "/api/dev/report":
+                return self._json({"ok": True, "data": self.dev.report_now()})
             if path == "/api/dev/frame.jpg":
                 return self._frame(q)
             if path == "/api/dev/stream.mjpg":
@@ -239,7 +256,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not p.exists():
             return {"lines": []}
         with open(p, "r", encoding="utf-8", errors="replace") as f:
-            return {"lines": [x.rstrip() for x in f.readlines()[-max(1, lines):]]}
+            return {"lines": [x.rstrip() for x in f.readlines()[-max(1, min(lines, 2000)):]]}
 
     def _frame(self, q: dict) -> None:
         quality = int(q.get("q", ["60"])[0])
@@ -285,21 +302,24 @@ class _Handler(BaseHTTPRequestHandler):
             body = self._body()
             if path == "/api/dev/cmd":
                 op = body.get("op") or ""
-                return self._json(self.dev.run_cmd(op, body.get("args") or {}, float(body.get("timeout") or 120)))
+                return self._json(self.dev.run_cmd(op, body.get("args") or {},
+                                                   float(body.get("timeout") or 120)))
             if path == "/api/dev/input":
-                res = self.dev.injector.apply(body.get("events") or [])
-                return self._json({"ok": True, "data": res})
+                return self._json({"ok": True, "data": self.dev.injector.apply(body.get("events") or [])})
             if path == "/api/dev/rules":
                 rules = body.get("rules") or {}
                 ver = int(body.get("version") or 0)
                 changed = self.dev.rules.merge(rules, ver)
                 if changed:
                     self.dev.rules.save(self.dev.cfg.rules_file)
-                return self._json({"ok": True, "data": {"changed": changed, "version": self.dev.rules.version}})
+                return self._json({"ok": True, "data": {"changed": changed,
+                                                          "version": self.dev.rules.version}})
             if path == "/api/dev/scan":
                 return self._json(self.dev.run_cmd("scan.now", {}, 300))
             if path == "/api/dev/sync":
                 return self._json(self.dev.run_cmd("sync.now", body.get("args") or {}, 1800))
+            if path == "/api/dev/report":
+                return self._json({"ok": True, "data": self.dev.report_now()})
             return self._json({"ok": False, "err": "未知路径"}, 404)
         except Exception as e:
             self.dev.errors += 1
