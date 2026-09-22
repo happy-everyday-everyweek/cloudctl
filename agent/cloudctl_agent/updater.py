@@ -1,11 +1,7 @@
 """OTA 自升级：从 GitHub Release 拉新版本，校验后就地替换自身。
 
-流程：读规则里的 update 段 -> 用镜像池访问 Releases API -> 比版本号 ->
-下载匹配的资产（可按 sha256 校验）-> 生成一个等待进程退出再替换的小脚本 ->
-脚本替换 exe 并重新拉起 -> 退出当前进程。
-
-只依赖标准库与 requests，配合 mirrors.py 的镜像池，国内网络也能取到新版本。
-冻结成 exe 时支持自我替换；以源码方式运行时只下载到本地并提示手工重启。
+修复：Windows 替换脚本以前用 timeout /t，在无控制台或被重定向的环境会直接失败，
+现改为 ping -n 延时；同时把 sha256 校验失败后的重试写成显式日志。
 """
 from __future__ import annotations
 
@@ -14,10 +10,8 @@ import json
 import os
 import platform
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -54,10 +48,6 @@ def is_newer(latest: str, current: str) -> bool:
     return a > b
 
 
-def sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
 class Updater:
     def __init__(self, cfg, rules, log, pool: MirrorPool | None = None,
                  current_version: str = "0.0.0", exe_path: Path | None = None) -> None:
@@ -65,7 +55,7 @@ class Updater:
         self.rules = rules
         self.log = log
         self.pool = pool or MirrorPool(cfg.home_path, log, pool_json=cfg.gh_mirror_pool,
-                                      top=cfg.gh_mirror_top)
+                                       top=cfg.gh_mirror_top)
         self.current = current_version
         self.exe_path = Path(exe_path) if exe_path else Path(sys.executable)
         self.last_check: dict[str, Any] = {}
@@ -73,7 +63,11 @@ class Updater:
 
     # ------------------------------------------------------------ 配置
     def conf(self) -> dict[str, Any]:
-        raw = (self.rules.data or {}).get("update") or {}
+        raw: dict[str, Any] = {}
+        try:
+            raw = (self.rules.update or {})
+        except Exception:
+            raw = (self.rules.data or {}).get("update") or {}
         out = dict(DEFAULTS)
         out.update({k: v for k, v in raw.items() if k in DEFAULTS})
         return out
@@ -142,26 +136,29 @@ class Updater:
         asset = None
         for a in assets:
             name = str(a.get("name") or "")
-            if pattern.lower() in name.lower():
-                if platform.system() == "Windows" and not name.lower().endswith(".exe"):
-                    continue
-                asset = a
-                break
-        res = {"ok": True, "current": self.current, "latest": latest,
-               "newer": is_newer(latest, self.current),
-               "prerelease": bool(data.get("prerelease")),
-               "published_at": data.get("published_at"),
-               "notes": (data.get("body") or "")[:2000],
-               "asset": ({"name": asset.get("name"), "size": asset.get("size"),
-                          "sha256": (asset.get("digest") or "").replace("sha256:", ""),
-                          "url": asset.get("browser_download_url")} if asset else None),
-               "checked_at": int(time.time())}
-        if c.get("verify_sha") and asset and not res["asset"]["sha256"]:
-            res["asset"]["sha256_source"] = "release 未提供摘要，改用 release notes 中的 sha256 行（若有）"
-            found = re.search(r"sha256[:= ]+([0-9a-fA-F]{64})", data.get("body") or "")
-            res["asset"]["sha256"] = found.group(1).lower() if found else ""
+            if pattern.lower() not in name.lower():
+                continue
+            if platform.system() == "Windows" and not name.lower().endswith(".exe"):
+                continue
+            asset = a
+            break
+        res: dict[str, Any] = {"ok": True, "current": self.current, "latest": latest,
+                               "newer": is_newer(latest, self.current),
+                               "prerelease": bool(data.get("prerelease")),
+                               "published_at": data.get("published_at"),
+                               "notes": (data.get("body") or "")[:2000],
+                               "asset": None, "checked_at": int(time.time())}
+        if asset:
+            digest = str(asset.get("digest") or "")
+            if digest.startswith("sha256:"):
+                digest = digest[len("sha256:"):]
+            if not digest:
+                found = re.search(r"sha256[:= ]+([0-9a-fA-F]{64})", data.get("body") or "")
+                digest = found.group(1).lower() if found else ""
+            res["asset"] = {"name": asset.get("name"), "size": asset.get("size"),
+                            "sha256": digest.lower(), "url": asset.get("browser_download_url")}
         self.last_check = res
-        self.last_error = "" if res.get("ok") else res.get("err", "")
+        self.last_error = ""
         self.log.info("OTA 检查：当前 %s，最新 %s，%s", self.current, latest,
                       "有新版本" if res["newer"] else "已是最新")
         return res
@@ -209,6 +206,7 @@ class Updater:
                 continue
             if self.conf().get("verify_sha") and expect and digest != expect.lower():
                 last = f"sha256 不匹配（期望 {expect[:12]}，实际 {digest[:12]}）"
+                self.log.warning("OTA 下载校验失败，换候选重试：%s", last)
                 try:
                     dest.unlink(missing_ok=True)
                 except Exception:
@@ -220,7 +218,6 @@ class Updater:
 
     # ------------------------------------------------------------ 应用
     def apply(self, new_exe: Path, restart: bool = True, delay_s: int | None = None) -> dict[str, Any]:
-        """生成替换脚本并启动它；调用方随后应主动退出进程。"""
         new_exe = Path(new_exe)
         if not new_exe.exists():
             return {"ok": False, "err": "新版本文件不存在"}
@@ -236,24 +233,24 @@ class Updater:
         log_file = script_dir / "ota.log"
         if platform.system() == "Windows":
             script = script_dir / "apply_update.cmd"
+            wait_ping = max(2, delay + 1)
             body = [
                 "@echo off",
-                f"echo [%date% %time%] OTA start >> \"{log_file}\"",
-                f"timeout /t {delay} /nobreak >nul",
+                f'echo [%date% %time%] OTA start >> "{log_file}"',
+                f"ping -n {wait_ping} 127.0.0.1 >nul",
                 ":wait",
                 f'tasklist /fi "IMAGENAME eq {target.name}" | find /i "{target.name}" >nul',
                 "if not errorlevel 1 (ping -n 2 127.0.0.1 >nul & goto wait)",
-                f"if exist \"{backup}\" del /f /q \"{backup}\"",
             ]
             if conf.get("keep_backup"):
-                body.append(f'move /y "{target}" "{backup}" >> \"{log_file}\" 2>&1')
-            body.append(f'move /y "{new_exe}" "{target}" >> \"{log_file}\" 2>&1')
+                body.append(f'move /y "{target}" "{backup}" >> "{log_file}" 2>&1')
+            body.append(f'move /y "{new_exe}" "{target}" >> "{log_file}" 2>&1')
             if restart:
                 body.append(f'start "" "{target}" --run')
-            body.append(f"echo [%date% %time%] OTA done >> \"{log_file}\"")
-            body.append("del /f /q \"%~f0\"")
+            body.append(f'echo [%date% %time%] OTA done >> "{log_file}"')
+            body.append('del /f /q "%~f0"')
             script.write_text("\r\n".join(body) + "\r\n", encoding="utf-8")
-            flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            flags = 0x00000008 | 0x00000200
             subprocess.Popen(["cmd", "/c", str(script)], creationflags=flags, close_fds=True)
         else:
             script = script_dir / "apply_update.sh"
