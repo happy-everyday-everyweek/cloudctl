@@ -2,14 +2,19 @@
 
 优先级：环境变量 > config.json > 默认值。默认工作目录：Windows 为 %ProgramData%\\cloudctl。
 
+配置文件位置：源码方式运行是 agent/config.json；单文件 exe 运行时是 exe 旁边的
+config.json（打包后 __file__ 指向临时解包目录，不能用它推路径）；
+两者都可以用环境变量 CLOUDCTL_CONFIG 指到任意路径。
+
 三类入口：设备本地控制台（devsrv）、两条平行外联通道（WS / GitHub）、局域网互联（mesh）。
-新增：存活上报与关机上报（report）。
+上报：存活上报与关机上报（report）。
 """
 from __future__ import annotations
 
 import json
 import os
 import socket
+import sys
 import uuid
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -193,6 +198,8 @@ class Config:
         env = os.environ.get("CLOUDCTL_CONFIG")
         if env:
             return Path(env)
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent / "config.json"
         return Path(__file__).resolve().parent.parent / "config.json"
 
     @classmethod
