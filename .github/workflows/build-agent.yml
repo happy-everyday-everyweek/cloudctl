@@ -7,6 +7,10 @@ on:
     paths: ['agent/**', '.github/workflows/build-agent.yml']
   workflow_dispatch:
 
+# 发布 Release 需要写权限；仓库默认只读时，缺少这段会导致打 tag 后步骤失败
+permissions:
+  contents: write
+
 jobs:
   windows-exe:
     runs-on: windows-latest
