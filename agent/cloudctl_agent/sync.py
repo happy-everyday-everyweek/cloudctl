@@ -1,12 +1,9 @@
 """素材归档：扫描 + 去重 + 分片 + 上传 + 索引。
 
-四层机制：
-1. 去重：本地 sqlite 记 sha256（已传过的直接跳），索引库再做第二道判定。
-2. 分片：单文件超过 max_single_mb 时不放弃，切成 size_mb 小片连清单一起传，
-   下载后按清单可复原，因此视频类也能进 GitHub。
-3. 上传：走 Contents API，若有镜像池则逐个候选重试，失败标 pending 待下轮。
-4. 索引：每轮结束把索引写成 kb/_index/index.json（可按类型分文件）传上去，
-   别人 clone 后不用拉全文就能检索。
+修复：
+1. 分片登记时 index_no 不再恒为 0（以前写成 `rec["name"][-8:] and 0`，永远得 0）。
+2. 索引与上传解耦：只要 index.enabled 且配了仓库就产出索引，
+   不再因为 upload.enabled=false 而完全不生成。
 """
 from __future__ import annotations
 
@@ -142,8 +139,6 @@ class Scanner:
 
 # ------------------------------------------------------------------ 上传
 class GitHubUploader:
-    """把文件提交到指定仓库，可选走镜像池候选重试。"""
-
     def __init__(self, log, pool=None) -> None:
         self.log = log
         self.pool = pool
@@ -152,8 +147,7 @@ class GitHubUploader:
     @staticmethod
     def remote_path(layout: str, prefix: str, kind: str, path: Path, sha: str, mtime: int) -> str:
         dt = datetime.fromtimestamp(mtime or time.time())
-        stem, ext = path.stem, path.suffix
-        name = f"{stem}-{sha[:8]}{ext}"
+        name = f"{path.stem}-{sha[:8]}{path.suffix}"
         out = (layout or "{prefix}/{type}/{yyyy}/{mm}/{name}").format(
             prefix=prefix.strip("/"), type=kind, yyyy=f"{dt:%Y}", mm=f"{dt:%m}", dd=f"{dt:%d}", name=name
         )
@@ -243,13 +237,17 @@ class SyncService:
 
     # --- 工具 ---
     def _staging_dir(self) -> Path:
-        base = self.staging or Path(".") / "chunk_staging"
+        base = self.staging or (self.rules and Path(".") / "chunk_staging") or Path(".") / "chunk_staging"
         base.mkdir(parents=True, exist_ok=True)
         return base
 
-    def _token(self) -> str:
+    def _upload_target(self) -> tuple[str, str, str]:
         up = self.rules.upload
-        return up.get("token") or self.rules.data.get("_upload_token", "")
+        idx = self.rules.index
+        repo = str(idx.get("repo") or up.get("repo") or "")
+        branch = str(idx.get("branch") or up.get("branch") or "main")
+        token = up.get("token") or self.rules.data.get("_upload_token", "") or self.rules.data.get("_gh_token", "")
+        return repo, branch, token
 
     def _remember(self, sha: str, remote: str, f: FoundFile, chunks: list[dict] | None = None) -> None:
         if self.index is None:
@@ -270,14 +268,12 @@ class SyncService:
             ck = self.rules.chunk
             files = self.scanner.walk()
             stats["scanned"] = len(files)
+            upload_repo, branch, token = self._upload_target()
             enabled = bool(up.get("enabled")) and bool(up.get("repo"))
             max_single = float(up.get("max_single_mb") or 90) * 1024 * 1024
             chunk_mb = float(ck.get("size_mb") or 40)
             layout = up.get("layout", "")
             prefix = up.get("prefix", "")
-            repo = up.get("repo", "")
-            branch = up.get("branch", "main")
-            token = self._token()
 
             for f in files[: int(limit)]:
                 try:
@@ -303,13 +299,12 @@ class SyncService:
 
                 remote = GitHubUploader.remote_path(layout, prefix, f.kind, f.path, sha, f.mtime)
 
-                # 超大文件走分片
                 if f.size > max_single:
                     if not ck.get("enabled"):
                         self.db.mark(sha, str(f.path), "", f.size, f.kind, "too_large")
                         stats["too_large"] += 1
                         continue
-                    res = self._upload_chunked(f, sha, remote, repo, branch, token, chunk_mb, ck)
+                    res = self._upload_chunked(f, sha, remote, upload_repo, branch, token, chunk_mb, ck)
                     if res.get("ok"):
                         stats["chunked"] += 1
                         stats["parts"] += int(res.get("parts") or 0)
@@ -325,7 +320,7 @@ class SyncService:
                     stats["failed"] += 1
                     stats["errors"].append(f"{f.path}: {e}")
                     continue
-                ok, err = self.uploader.put(repo, branch, remote, data, token,
+                ok, err = self.uploader.put(upload_repo, branch, remote, data, token,
                                             f"kb: add {f.kind} {f.path.name}")
                 if ok:
                     self.db.mark(sha, str(f.path), remote, f.size, f.kind, "done" if not err else "exists")
@@ -340,8 +335,9 @@ class SyncService:
                         stats["errors"].append("触发 GitHub 速率限制，已中止本轮")
                         break
 
-            if enabled and self.rules.index.get("enabled"):
-                stats["index"] = self.upload_index(repo, branch, token)
+            # 索引与上传解耦：只要开了索引且配了仓库就产出
+            if self.rules.index.get("enabled") and self.index is not None:
+                stats["index"] = self.upload_index()
 
             stats["elapsed"] = round(time.time() - started, 2)
             stats["bytes_h"] = human_size(stats["bytes"])
@@ -361,15 +357,15 @@ class SyncService:
 
     def _upload_chunked(self, f: FoundFile, sha: str, remote: str, repo: str, branch: str,
                         token: str, chunk_mb: float, ck: dict) -> dict[str, Any]:
-        """切片、上传分片与清单，并把父文件登记到索引。"""
         parts_dir = f"{remote}.parts"
         try:
             manifest = chunker.split(f.path, self._staging_dir() / sha[:12], size_mb=chunk_mb)
         except Exception as e:
             self.db.mark(sha, str(f.path), remote, f.size, f.kind, "pending", f"分片失败：{e}")
             return {"ok": False, "err": f"分片失败：{e}"}
+        by_name = {p["name"]: p for p in manifest["parts"]}
         part_records: list[dict] = []
-        for name, ppath in chunker.iter_parts(manifest):
+        for idx, (name, ppath) in enumerate(chunker.iter_parts(manifest)):
             try:
                 payload = ppath.read_bytes()
             except OSError as e:
@@ -379,11 +375,11 @@ class SyncService:
             if not ok:
                 self.db.mark(sha, str(f.path), parts_dir, f.size, f.kind, "pending", err)
                 return {"ok": False, "err": f"分片上传失败 {name}: {err}"}
-            rec = {"name": name, "bytes": len(payload), "sha256": next(
-                (p.get("sha256") for p in manifest["parts"] if p["name"] == name), "")}
+            rec = {"name": name, "index": idx, "bytes": len(payload),
+                   "sha256": str((by_name.get(name) or {}).get("sha256") or "")}
             part_records.append(rec)
-            if self.index is not None:
-                self.index.add_part(rec["sha256"], sha, f"{parts_dir}/{name}", rec["name"][-8:] and 0, len(payload))
+            if self.index is not None and rec["sha256"]:
+                self.index.add_part(rec["sha256"], sha, f"{parts_dir}/{name}", idx, len(payload))
         manifest["parts_dir"] = parts_dir
         manifest["original_remote"] = remote
         ok, err = self.uploader.put(repo, branch, f"{parts_dir}/{f.path.name}.parts.json",
@@ -400,13 +396,13 @@ class SyncService:
         return {"ok": True, "parts": len(part_records), "parts_dir": parts_dir}
 
     # --- 索引 ---
-    def upload_index(self, repo: str = "", branch: str = "", token: str = "") -> int:
+    def upload_index(self) -> int:
         idx_cfg = self.rules.index
-        up = self.rules.upload
-        repo = repo or up.get("repo", "")
-        branch = branch or up.get("branch", "main")
-        token = token or self._token()
+        repo, branch, token = self._upload_target()
         if not repo or self.index is None:
+            return 0
+        if not token:
+            self.log.debug("索引未上传：缺少写入令牌")
             return 0
         writer = RepoIndex(self.index, device_id=self.device_id, branch=branch)
         count = 0
