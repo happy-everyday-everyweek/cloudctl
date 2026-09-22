@@ -6,6 +6,7 @@
     agent --install / --uninstall / --status
     agent --scan                立即跑一轮扫描归档
     agent --photo               立即截屏一张
+    agent --report              立即上报一次（存活上报的即时版）
     agent --rules PATH          应用规则文件
     agent --mesh-peers / --mesh-send ID OP
     agent --cameras / --mic-devices / --audio-level N
@@ -13,12 +14,17 @@
     agent --index / --index-search K / --index-build
     agent --update-check        只看有没有新版本
     agent --update-apply        下载并就地替换（会重启自己）
+
+上报有三个时机：启动、按 interval_s 定时（证明设备活着）、退出或关机（同步兜底）。
+关机优先走 Windows 控制台事件钩子；拿不到钩子时由退出路径补发一次。
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
+import os
 import signal
 import sys
 import threading
@@ -41,9 +47,66 @@ from .rules import RuleSet, TriggerEngine
 from .startup import install as startup_install, remove as startup_remove, status as startup_status
 from .sync import StateDB, SyncService
 from .updater import Updater, UpdateService
-from .util import IS_WINDOWS, foreground_window, idle_seconds, session_is_locked, set_dpi_aware, setup_logging
+from .util import (IS_WINDOWS, foreground_window, idle_seconds, session_is_locked,
+                   set_dpi_aware, setup_logging, title_match_any)
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
+REPORT_MIN_INTERVAL = 30
+CONSOLE_SHUTDOWN_EVENTS = (2, 5, 6)   # 关闭窗口 / 注销 / 关机
+
+
+# ------------------------------------------------------------------ 上报载荷
+
+def _metrics() -> dict:
+    """CPU 与内存占用。psutil 缺失时返回空字典，不影响上报本身。"""
+    out: dict = {}
+    try:
+        import psutil  # type: ignore
+        out["cpu"] = psutil.cpu_percent(interval=None)
+        vm = psutil.virtual_memory()
+        out["mem"] = vm.percent
+        out["mem_used_mb"] = int(vm.used / (1024 * 1024))
+    except Exception:
+        pass
+    try:
+        import shutil
+        du = shutil.disk_usage(str(Path.home()))
+        out["disk"] = int(du.used * 100 / du.total)
+    except Exception:
+        pass
+    return out
+
+
+def build_report(cfg: Config, rules: RuleSet, kind: str, *, version: str = VERSION,
+                 uptime_s: int = 0, channel=None, extra: dict | None = None) -> dict:
+    """一条上报就是一条普通事件，走同一条通道，不需要额外的协议端点。"""
+    rep = rules.report
+    include = bool(cfg.report_include_metrics and rep.get("include_metrics", True))
+    data: dict = {
+        "kind": kind, "ver": version, "device_id": cfg.device_id, "name": cfg.device_name,
+        "group": cfg.group, "rules_v": rules.version, "ts": int(time.time()),
+        "uptime_s": int(uptime_s), "pid": os.getpid(),
+    }
+    if include:
+        data["metrics"] = _metrics()
+    if channel is not None:
+        try:
+            data["links"] = {k: bool(v.get("connected")) for k, v in channel.links.items()}
+            data["queued"] = channel.queued()
+        except Exception:
+            pass
+    if extra:
+        data.update(extra)
+    return {"type": "event", "event": "agent.report",
+            "id": f"rep-{cfg.device_id}-{int(time.time() * 1000)}", "data": data}
+
+
+async def _noop_message(_msg: dict):
+    return None
+
+
+async def _noop_rules(_rules: dict, _version: int = 0) -> None:
+    return None
 
 
 class Agent:
@@ -74,6 +137,13 @@ class Agent:
         self._stop = threading.Event()
         self._recording = False
         self._rec_status: dict = {}
+        self._started_ts = time.time()
+        self._main_task: asyncio.Task | None = None
+        self._loop_thread: threading.Thread | None = None
+        self._shutdown_reported = False
+        self._ctrl_handler = None
+        self._slide_sig: int | None = None
+        self._slide_poll_ts = 0.0
 
     # ------------------------------------------------------------ 生命周期
     async def apply_rules(self, incoming: dict, version: int = 0) -> None:
@@ -105,13 +175,17 @@ class Agent:
     async def run(self) -> None:
         set_dpi_aware()
         self.loop = asyncio.get_running_loop()
+        self._loop_thread = threading.current_thread()
+        self._main_task = asyncio.current_task()
         self.router = Router(
             self.cfg, self.rules, self.capture, self.streamer, self.injector,
             self.sync, self.db, self.log, self.apply_rules, self.updater,
+            on_report=self._report_now_sync, report_info=self._report_info,
         )
         self.devsrv = DeviceServer(
             self.cfg, self.rules, self.capture, self.injector, self.sync, self.log,
             get_router=lambda: self.router, get_loop=lambda: self.loop,
+            on_report=self._report_now_sync, agent_version=VERSION,
         )
         info = self.devsrv.start()
         self.log.info("设备本地控制台%s %s", "已就绪" if info.get("enabled") else "未启用",
@@ -137,13 +211,19 @@ class Agent:
             while not self._stop.is_set():
                 await asyncio.sleep(0.5)
             return
-        self.channel = ControlChannel(self.cfg, self.on_message, self.apply_rules, self.log)
+        self.channel = ControlChannel(self.cfg, self.on_message, self.apply_rules, self.log,
+                                      version=VERSION)
+        self._install_console_handler()
         await self._emit({"type": "event", "event": "agent.online",
                           "data": {"ver": VERSION, "rules": self.rules.version}})
+        if self.report_enabled("on_start"):
+            await self._emit(self.report_payload("start"))
+        threading.Thread(target=self._report_loop, name="report", daemon=True).start()
         try:
             await self.channel.run()
         finally:
             self._stop.set()
+            self._shutdown_report("exit")
 
     async def _emit(self, obj: dict) -> None:
         if self.channel:
@@ -154,6 +234,124 @@ class Agent:
             return
         asyncio.run_coroutine_threadsafe(self.channel.send(obj), self.loop)
 
+    # ------------------------------------------------------------ 上报
+    def report_rule(self) -> dict:
+        return self.rules.report
+
+    def report_enabled(self, key: str = "enabled") -> bool:
+        """配置与规则任一关闭即不上报；规则侧只能收紧，和权限开关同一口径。"""
+        if not self.cfg.report_enabled:
+            return False
+        rule = self.report_rule()
+        if key != "enabled" and not rule.get("enabled", True):
+            return False
+        return bool(rule.get(key, True))
+
+    def report_interval(self) -> float:
+        rule = self.report_rule()
+        try:
+            n = int(rule.get("interval_s") or self.cfg.report_interval_s)
+        except Exception:
+            n = int(self.cfg.report_interval_s)
+        return float(max(REPORT_MIN_INTERVAL, n))
+
+    def report_payload(self, kind: str, extra: dict | None = None) -> dict:
+        return build_report(self.cfg, self.rules, kind, version=VERSION,
+                            uptime_s=int(time.time() - self._started_ts),
+                            channel=self.channel, extra=extra)
+
+    def _report_loop(self) -> None:
+        self.log.info("存活上报已启动：间隔 %ss（规则可覆盖）", self.report_interval())
+        while not self._stop.is_set():
+            deadline = time.time() + self.report_interval()
+            while not self._stop.is_set() and time.time() < deadline:
+                time.sleep(0.5)
+            if self._stop.is_set():
+                break
+            if not self.report_enabled():
+                self.log.debug("上报已关闭，跳过本轮")
+                continue
+            self._emit_threadsafe(self.report_payload("alive"))
+
+    def _report_info(self) -> dict:
+        rule = self.report_rule()
+        return {"enabled": self.report_enabled(), "interval_s": self.report_interval(),
+                "on_start": self.report_enabled("on_start"),
+                "on_shutdown": self.report_enabled("on_shutdown"),
+                "shutdown_wait_s": int(self.cfg.report_shutdown_wait_s),
+                "include_metrics": bool(self.cfg.report_include_metrics),
+                "uptime_s": int(time.time() - self._started_ts),
+                "online": bool(self.channel.online) if self.channel else False,
+                "queued": self.channel.queued() if self.channel else {},
+                "rules": rule}
+
+    def _report_now_sync(self) -> dict:
+        """同步上报一次：本地控制台按钮、云端命令、关机钩子都走这里。"""
+        if not self.report_enabled():
+            return {"ok": False, "err": "上报已关闭", "sent": False}
+        return self._flush(self.report_payload("manual"))
+
+    def _flush(self, payload: dict, timeout: float | None = None) -> dict:
+        ch = self.channel
+        if ch is None:
+            return {"ok": False, "err": "未建立外联通道", "sent": False}
+        wait = float(self.cfg.report_shutdown_wait_s if timeout is None else timeout)
+        if threading.current_thread() is self._loop_thread:
+            # 事件循环线程里不能再跑 asyncio.run，交给独立线程并等它一会儿
+            box: dict = {}
+            t = threading.Thread(target=lambda: box.update(ch.flush_sync(payload, wait)), daemon=True)
+            t.start()
+            t.join(timeout=wait + 2)
+            res = box or {"ok": False, "err": "上报超时", "sent": False}
+        else:
+            res = ch.flush_sync(payload, wait)
+        ok = bool(res.get("ws") or res.get("gh"))
+        res["ok"] = ok
+        res["sent"] = ok
+        if not ok:
+            res["err"] = "两条通道都不可达，已落盘待补发"
+        return res
+
+    def _shutdown_report(self, kind: str = "shutdown") -> None:
+        if self._shutdown_reported:
+            return
+        self._shutdown_reported = True
+        if not self.report_enabled("on_shutdown"):
+            return
+        try:
+            res = self._flush(self.report_payload(kind))
+            self.log.info("%s 上报结果：%s", kind, res)
+        except Exception as e:
+            self.log.warning("关机上报异常：%s", e)
+
+    def _install_console_handler(self) -> None:
+        """Windows 关机/注销时会送控制台事件，这是关机上报的主要触发点。"""
+        if not IS_WINDOWS:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            handler_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+            def _handler(evt: int) -> bool:
+                if evt in CONSOLE_SHUTDOWN_EVENTS:
+                    try:
+                        self._shutdown_report("shutdown_signal")
+                    except Exception:
+                        pass
+                else:
+                    self._stop.set()
+                return True
+
+            self._ctrl_handler = handler_type(_handler)
+            if not ctypes.windll.kernel32.SetConsoleCtrlHandler(self._ctrl_handler, True):
+                raise OSError("SetConsoleCtrlHandler 返回失败")
+            self.log.info("已挂接关机/注销钩子，关机时会先发一次上报")
+        except Exception as e:
+            self._ctrl_handler = None
+            self.log.warning("无法挂接关机钩子（无控制台或被系统限制）：%s；改由退出路径补发", e)
+
     # ------------------------------------------------------------ 自动采集
     def _trigger_loop(self) -> None:
         self.log.info("采集调度已启动")
@@ -163,7 +361,8 @@ class Agent:
                 title, _pid = foreground_window()
                 idle = idle_seconds()
                 locked = session_is_locked()
-                decision = self.engine.decide(title, idle, locked)
+                slide = self._slide_changed(title)
+                decision = self.engine.decide(title, idle, locked, slide_changed=slide)
                 if decision["video_stop"] and self._recording:
                     self._recording = False
                     self._emit_threadsafe({"type": "event", "event": "capture.video_stop",
@@ -178,6 +377,33 @@ class Agent:
             except Exception as e:
                 self.log.warning("采集判定异常：%s", e)
                 time.sleep(10)
+
+    def _slide_changed(self, title: str) -> bool:
+        """只有当前台是幻灯片放映窗口时才取样，避免白花抓屏开销。"""
+        sl = self.rules.slideshow
+        if not sl.get("enabled"):
+            return False
+        if not title or not title_match_any(title, sl.get("titles") or []):
+            self._slide_sig = None
+            return False
+        now = time.time()
+        if now - self._slide_poll_ts < float(sl.get("poll_s") or 4):
+            return False
+        self._slide_poll_ts = now
+        monitor = max(0, int(self.rules.desktop.get("monitors", 1) - 1))
+        try:
+            changed, sig, _info = self.capture.is_slide_changed(
+                self._slide_sig, monitor, int(sl.get("threshold") or 12))
+        except Exception as e:
+            self.log.debug("翻页检测取样失败：%s", e)
+            return False
+        first_sample = self._slide_sig is None
+        self._slide_sig = sig
+        if first_sample:
+            return False
+        if changed:
+            self.engine.note_slide()
+        return bool(changed)
 
     def _take_photo(self) -> None:
         ph = self.rules.photo
@@ -203,9 +429,13 @@ class Agent:
         self._recording = True
         self.engine.note_video_start()
 
+        def _should_stop() -> bool:
+            return self._stop.is_set() or not self._recording
+
         def _job() -> None:
             try:
-                info = self.capture.record(seconds=seconds, fps=fps, quality=quality, monitor=monitor)
+                info = self.capture.record(seconds=seconds, fps=fps, quality=quality,
+                                           monitor=monitor, should_stop=_should_stop)
                 self.engine.note_video_bytes(int(info.get("bytes") or 0))
                 self._rec_status = info
                 self._emit_threadsafe({"type": "event", "event": "capture.video_done",
@@ -228,7 +458,7 @@ class Agent:
             time.sleep(interval * 60)
             if self._stop.is_set():
                 break
-            if not self.rules.upload.get("enabled"):
+            if not (self.rules.upload.get("enabled") or self.rules.index.get("enabled")):
                 continue
             try:
                 stats = self.sync.sync_once()
@@ -238,6 +468,13 @@ class Agent:
 
     def stop(self) -> None:
         self._stop.set()
+        self._shutdown_report("shutdown")
+        loop, task = self.loop, self._main_task
+        if loop is not None and task is not None and not task.done():
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except Exception:
+                pass
         for svc in (self.devsrv, self.mesh, self.camcap, self.updates):
             if svc is not None:
                 try:
@@ -283,6 +520,23 @@ def _mesh_probe(cfg: Config, seconds: int, send: list[str] | None = None) -> int
     return 0
 
 
+def _report_once(cfg: Config, log) -> int:
+    """--report：不建常驻循环，同步发一次就走，方便验证通道是否通。"""
+    rules = RuleSet.load(cfg.rules_file)
+    if not cfg.report_enabled or not rules.report.get("enabled", True):
+        print(json.dumps({"ok": False, "err": "上报已关闭（config.report_enabled 或 rules.report.enabled）"},
+                         ensure_ascii=False, indent=2))
+        return 1
+    ch = ControlChannel(cfg, _noop_message, _noop_rules, log, version=VERSION)
+    payload = build_report(cfg, rules, "manual", version=VERSION, channel=ch)
+    res = ch.flush_sync(payload, float(cfg.report_shutdown_wait_s))
+    res["ok"] = bool(res.get("ws") or res.get("gh"))
+    if not res["ok"]:
+        res["err"] = "两条通道都不可达，已落盘待补发"
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+    return 0 if res["ok"] else 1
+
+
 def _audio_probe(cfg: Config, seconds: int) -> int:
     rules = RuleSet.load(cfg.rules_file)
     au = rules.audio
@@ -317,6 +571,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--scan", action="store_true")
     ap.add_argument("--photo", action="store_true")
+    ap.add_argument("--report", action="store_true", help="立即上报一次（存活上报的即时版）")
     ap.add_argument("--rules", default="")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--mesh-peers", action="store_true")
@@ -419,6 +674,10 @@ def main(argv: list[str] | None = None) -> int:
                         "audio_trigger": rules.audio.get("enabled"),
                         "threshold_db": rules.audio.get("threshold_db"),
                         "chunk_mb": rules.chunk.get("size_mb")},
+            "report": {"enabled": cfg.report_enabled, "interval_s": cfg.report_interval_s,
+                       "on_start": cfg.report_on_start, "on_shutdown": cfg.report_on_shutdown,
+                       "shutdown_wait_s": cfg.report_shutdown_wait_s,
+                       "include_metrics": cfg.report_include_metrics, "rules": rules.report},
             "ota": up.status(),
             "index": idx.summary(),
         }, ensure_ascii=False, indent=2))
@@ -438,6 +697,8 @@ def main(argv: list[str] | None = None) -> int:
         agent = Agent(cfg)
         print(json.dumps(agent.capture.photo_screen(), ensure_ascii=False, indent=2))
         return 0
+    if args.report:
+        return _report_once(cfg, log)
 
     agent = Agent(cfg)
     agent.console_only = bool(args.console)
@@ -454,6 +715,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         asyncio.run(agent.run())
     except KeyboardInterrupt:
+        pass
+    except asyncio.CancelledError:
         pass
     return 0
 
