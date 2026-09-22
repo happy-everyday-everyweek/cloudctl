@@ -1,7 +1,8 @@
 """采集层：屏幕 / 摄像头拍照、屏幕录制、幻灯片翻页感知。
 
-录像优先用 ffmpeg 的 gdigrab（Windows）录，拿不到 ffmpeg 时回退到
-逐帧抓屏 + OpenCV 写盘，保证不依赖外部工具也能跑。
+录屏优先用 ffmpeg gdigrab，拿不到时回退逐帧抓屏 + OpenCV 写盘。
+本次修复：record 支持 should_stop 回调，声控/翻页这类触发可以中途停录；
+ffmpeg 分支改用 frag_keyframe 输出，中途终止也留下可播放的文件。
 """
 from __future__ import annotations
 
@@ -12,20 +13,18 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .util import IS_WINDOWS, human_size
 
 
 def _pil():
     from PIL import Image  # type: ignore
-
     return Image
 
 
 def _mss():
     import mss  # type: ignore
-
     return mss
 
 
@@ -85,24 +84,15 @@ class CaptureService:
         day_dir.mkdir(parents=True, exist_ok=True)
         return day_dir / f"{ts}{suffix}.{ext}"
 
-    # --- 屏幕截图 ---
     def photo_screen(self, monitor: int = 0, quality: int = 80, path: str | None = None) -> dict[str, Any]:
         img = ScreenSource(monitor).grab()
         p = Path(path) if path else self._target("photo", "jpg", tag=f"m{monitor}")
         p.parent.mkdir(parents=True, exist_ok=True)
         img.save(p, quality=int(quality))
-        return {
-            "kind": "screen",
-            "path": str(p),
-            "bytes": p.stat().st_size,
-            "size_h": human_size(p.stat().st_size),
-            "w": img.width,
-            "h": img.height,
-            "sig": dhash(img),
-            "ts": int(time.time()),
-        }
+        size = p.stat().st_size
+        return {"kind": "screen", "path": str(p), "bytes": size, "size_h": human_size(size),
+                "w": img.width, "h": img.height, "sig": dhash(img), "ts": int(time.time())}
 
-    # --- 摄像头拍照 ---
     def photo_camera(self, index: int = 0, path: str | None = None, warmup: int = 5) -> dict[str, Any]:
         import cv2  # type: ignore
 
@@ -111,7 +101,7 @@ class CaptureService:
             raise RuntimeError(f"摄像头 {index} 打开失败")
         try:
             frame = None
-            for _ in range(max(1, warmup)):  # 前几帧是黑的，丢弃
+            for _ in range(max(1, warmup)):
                 ok, frame = cap.read()
                 if not ok:
                     time.sleep(0.05)
@@ -124,27 +114,14 @@ class CaptureService:
         p = Path(path) if path else self._target("photo", "jpg", tag=f"cam{index}")
         p.parent.mkdir(parents=True, exist_ok=True)
         img.save(p, quality=85)
-        return {
-            "kind": "camera",
-            "index": int(index),
-            "path": str(p),
-            "bytes": p.stat().st_size,
-            "size_h": human_size(p.stat().st_size),
-            "w": img.width,
-            "h": img.height,
-            "sig": dhash(img),
-            "ts": int(time.time()),
-        }
+        size = p.stat().st_size
+        return {"kind": "camera", "index": int(index), "path": str(p), "bytes": size,
+                "size_h": human_size(size), "w": img.width, "h": img.height,
+                "sig": dhash(img), "ts": int(time.time())}
 
     # --- 录制 ---
-    def record(
-        self,
-        seconds: int = 60,
-        fps: int = 5,
-        quality: int = 60,
-        monitor: int = 0,
-        path: str | None = None,
-    ) -> dict[str, Any]:
+    def record(self, seconds: int = 60, fps: int = 5, quality: int = 60, monitor: int = 0,
+               path: str | None = None, should_stop: Callable[[], bool] | None = None) -> dict[str, Any]:
         seconds = max(1, int(seconds))
         fps = max(1, min(30, int(fps)))
         p = Path(path) if path else self._target("video", "mp4", tag=f"m{monitor}")
@@ -152,25 +129,55 @@ class CaptureService:
 
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg and IS_WINDOWS:
-            return self._record_ffmpeg(ffmpeg, p, seconds, fps, quality)
-        return self._record_frames(p, seconds, fps, monitor)
+            return self._record_ffmpeg(ffmpeg, p, seconds, fps, quality, should_stop)
+        return self._record_frames(p, seconds, fps, monitor, should_stop)
 
-    def _record_ffmpeg(self, ffmpeg: str, p: Path, seconds: int, fps: int, quality: int) -> dict[str, Any]:
+    def _record_ffmpeg(self, ffmpeg: str, p: Path, seconds: int, fps: int, quality: int,
+                       should_stop: Callable[[], bool] | None = None) -> dict[str, Any]:
         crf = max(18, min(34, int(40 - quality * 0.25)))
         cmd = [
             ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
             "-f", "gdigrab", "-framerate", str(fps), "-i", "desktop",
             "-t", str(seconds),
             "-vcodec", "libx264", "-preset", "veryfast", "-crf", str(crf),
-            "-pix_fmt", "yuv420p", str(p),
+            "-pix_fmt", "yuv420p", "-movflags", "frag_keyframe+empty_moov",
+            str(p),
         ]
-        proc = subprocess.run(cmd, capture_output=True, timeout=seconds + 60)
-        if proc.returncode != 0 or not p.exists():
-            self.log.warning("ffmpeg 录制失败，回退逐帧：%s", (proc.stderr or b"")[-200:])
-            return self._record_frames(p, seconds, fps, 0)
-        return {"kind": "video", "encoder": "ffmpeg", "path": str(p), "bytes": p.stat().st_size, "size_h": human_size(p.stat().st_size), "seconds": seconds, "fps": fps, "ts": int(time.time())}
+        started = time.time()
+        early = False
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        except Exception as e:
+            self.log.warning("ffmpeg 启动失败，回退逐帧：%s", e)
+            return self._record_frames(p, seconds, fps, 0, should_stop)
+        while proc.poll() is None:
+            if should_stop is not None and should_stop():
+                early = True
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+                break
+            if time.time() - started > seconds + 60:
+                proc.kill()
+                break
+            time.sleep(0.2)
+        if not p.exists() or p.stat().st_size == 0:
+            err = b""
+            try:
+                err = proc.stderr.read() if proc.stderr else b""
+            except Exception:
+                pass
+            self.log.warning("ffmpeg 录制未产出文件，回退逐帧：%s", (err or b"")[-200:])
+            return self._record_frames(p, seconds, fps, 0, should_stop)
+        size = p.stat().st_size
+        return {"kind": "video", "encoder": "ffmpeg", "path": str(p), "bytes": size,
+                "size_h": human_size(size), "seconds": round(time.time() - started, 1),
+                "fps": fps, "stopped_early": early, "ts": int(time.time())}
 
-    def _record_frames(self, p: Path, seconds: int, fps: int, monitor: int) -> dict[str, Any]:
+    def _record_frames(self, p: Path, seconds: int, fps: int, monitor: int,
+                       should_stop: Callable[[], bool] | None = None) -> dict[str, Any]:
         import cv2  # type: ignore
         import numpy as np  # type: ignore
 
@@ -183,8 +190,12 @@ class CaptureService:
         interval = 1.0 / fps
         end = time.time() + seconds
         frames = 0
+        early = False
         try:
             while time.time() < end:
+                if should_stop is not None and should_stop():
+                    early = True
+                    break
                 t0 = time.time()
                 img = first if frames == 0 else src.grab()
                 if img.size != (w, h):
@@ -194,11 +205,14 @@ class CaptureService:
                 time.sleep(max(0.0, interval - (time.time() - t0)))
         finally:
             writer.release()
-        return {"kind": "video", "encoder": "opencv", "path": str(p), "bytes": p.stat().st_size, "size_h": human_size(p.stat().st_size), "seconds": seconds, "fps": fps, "frames": frames, "ts": int(time.time())}
+        size = p.stat().st_size if p.exists() else 0
+        return {"kind": "video", "encoder": "opencv", "path": str(p), "bytes": size,
+                "size_h": human_size(size), "seconds": seconds, "fps": fps,
+                "frames": frames, "stopped_early": early, "ts": int(time.time())}
 
     # --- 幻灯片翻页感知 ---
-    def is_slide_changed(self, prev_sig: int | None, monitor: int = 0, threshold: int = 12, quality: int = 70) -> tuple[bool, int, dict]:
-        """返回（是否翻页, 当前签名, 截图信息）。签名会顺便复用给录像使用。"""
+    def is_slide_changed(self, prev_sig: int | None, monitor: int = 0,
+                         threshold: int = 12) -> tuple[bool, int, dict]:
         img = ScreenSource(monitor).grab()
         sig = dhash(img)
         changed = prev_sig is None or hamming(prev_sig, sig) >= max(1, int(threshold))
