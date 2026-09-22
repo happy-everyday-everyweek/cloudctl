@@ -1,7 +1,8 @@
 """命令路由：把服务端、本地控制台或局域网邻居下发的消息分发到具体子系统。
 
 所有破坏性操作都过一遍规则里的 security 开关，服务端与客户端双重门禁，
-任意一侧关闭都不执行。OTA 相关动作统一走 agent.update 这一个入口。
+任意一侧关闭都不执行。OTA 相关动作统一走 agent.update 这一个入口，
+上报走 report.now / report.status。
 """
 from __future__ import annotations
 
@@ -31,6 +32,8 @@ class Router:
         log,
         apply_rules: Callable[[dict, int], Awaitable[None]],
         updater=None,
+        on_report: Callable[[], dict] | None = None,
+        report_info: Callable[[], dict] | None = None,
     ) -> None:
         self.cfg = cfg
         self.rules = rules
@@ -42,6 +45,8 @@ class Router:
         self.log = log
         self.apply_rules = apply_rules
         self.updater = updater
+        self.on_report = on_report
+        self.report_info = report_info
         self.sessions: dict[str, ops.ShellSession] = {}
         self.stats = {"commands": 0, "errors": 0, "started_ts": int(time.time())}
 
@@ -198,6 +203,14 @@ class Router:
         # --- OTA ---
         if op == "agent.update":
             return await self._update(args)
+
+        # --- 上报 ---
+        if op == "report.now":
+            if self.on_report is None:
+                raise ValueError("上报未装配")
+            return await asyncio.to_thread(self.on_report)
+        if op == "report.status":
+            return self.report_info() if self.report_info is not None else {}
 
         # --- 规则与自身 ---
         if op == "agent.rules":
