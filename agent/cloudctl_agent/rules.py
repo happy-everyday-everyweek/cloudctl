@@ -1,7 +1,8 @@
-"""规则引擎：规则合并、以及“何时拍照/录像/声控录音”的判定。
+"""规则引擎：规则合并、以及遥控制策略。
 
 规则来源：中心服务端或仓库文件，本地缓存在 rules.json，断网时继续沿用缓存执行。
-新增三类能力：摄像头录像（camera）、声音阈值触发（audio）、大文件分片（chunk）与索引（index）。
+段落：capture（photo / video / camera / audio / slideshow）、scan、upload（含 chunk）、
+index、report（存活与关机上报）、update（OTA）。
 """
 from __future__ import annotations
 
@@ -57,7 +58,6 @@ DEFAULT_RULES: dict[str, Any] = {
             "quality": 70,
             "segment_s": 120,
             "min_segment_s": 5,
-            "pre_roll_s": 3,
             "max_mb_per_day": 2000,
             "active_hours": None,
             "cooldown_s": 30,
@@ -71,7 +71,6 @@ DEFAULT_RULES: dict[str, Any] = {
             "threshold_db": -35.0,
             "attack_s": 0.3,
             "hold_s": 3.0,
-            "silence_stop": True,
             "save_audio": False,
             "max_mb_per_day": 2000,
             "active_hours": None,
@@ -82,6 +81,7 @@ DEFAULT_RULES: dict[str, Any] = {
             "titles": ["PowerPoint 幻灯片放映", "Slide Show", "Presentation"],
             "threshold": 12,
             "cooldown_s": 3,
+            "poll_s": 4,
         },
     },
     "scan": {
@@ -112,23 +112,42 @@ DEFAULT_RULES: dict[str, Any] = {
         "layout": "{prefix}/{type}/{yyyy}/{mm}/{name}",
         "dedup": "sha256",
         "max_single_mb": 90,
-        "chunk_video": True,
-        "chunk_seconds": 600,
         "concurrency": 2,
         "chunk": {
             "enabled": True,
             "size_mb": 40,
             "keep_parts": True,
-            "manifest_dir": "kb/_manifests",
         },
     },
     "index": {
         "enabled": True,
+        "repo": "",
+        "branch": "",
         "path": "kb/_index/index.json",
         "per_kind": True,
         "dedup": "sha256",
         "include_chunks": True,
         "max_entries": 20000,
+    },
+    "report": {
+        "enabled": True,
+        "interval_s": 300,
+        "on_start": True,
+        "on_shutdown": True,
+        "shutdown_wait_s": 8,
+        "include_metrics": True,
+    },
+    "update": {
+        "enabled": False,
+        "repo": "happy-everyday-everyweek/cloudctl",
+        "channel": "latest",
+        "tag": "",
+        "asset_pattern": "cloudctl-agent",
+        "check_min": 60,
+        "verify_sha": True,
+        "auto_apply": False,
+        "keep_backup": True,
+        "restart_delay_s": 5,
     },
     "desktop": {"max_fps": 10, "allow_input": True, "monitors": 1, "quality": 60},
     "security": {"allow_shell": True, "allow_file_write": True, "allow_delete": False},
@@ -190,6 +209,14 @@ class RuleSet:
         return self.data["index"]
 
     @property
+    def report(self) -> dict:
+        return self.data["report"]
+
+    @property
+    def update(self) -> dict:
+        return self.data["update"]
+
+    @property
     def desktop(self) -> dict:
         return self.data["desktop"]
 
@@ -198,14 +225,12 @@ class RuleSet:
         return self.data["security"]
 
     def ext_map(self) -> dict[str, str]:
-        """扩展名 -> 类型，如 pptx -> doc。"""
         out: dict[str, str] = {}
         for kind, exts in (self.data["scan"].get("types") or {}).items():
             for e in exts:
                 out[str(e).lower().lstrip(".")] = kind
         return out
 
-    # --- 持久化 ---
     @classmethod
     def load(cls, path: Path) -> "RuleSet":
         return cls(read_json(path, {}) or {})
@@ -214,7 +239,6 @@ class RuleSet:
         write_json(path, self.data)
 
     def merge(self, incoming: dict[str, Any], version: int = 0) -> bool:
-        """合并新规则，仅当版本号更新时生效。返回是否发生变化。"""
         new_ver = int(version or (incoming or {}).get("version") or 0)
         if new_ver and new_ver <= self.version:
             return False
@@ -234,6 +258,7 @@ class TriggerState:
     last_video_start_ts: float = 0.0
     last_camera_start_ts: float = 0.0
     last_audio_start_ts: float = 0.0
+    last_slide_ts: float = 0.0
     last_title: str = ""
     title_seen_ts: float = 0.0
     last_reason: str = ""
@@ -241,11 +266,7 @@ class TriggerState:
 
 
 class TriggerEngine:
-    """把“什么时候拍”收敛到一个地方。
-
-    输入当前前台窗口与空闲时长，输出本轮是否开始/停止录屏、是否拍照。
-    声控录制（麦克风阀值）与摄像头配额也在本类统计。
-    """
+    """把“什么时候拍、什么时候录”收敛到一个地方，并统计配额。"""
 
     def __init__(self, rules: RuleSet) -> None:
         self.rules = rules
@@ -284,6 +305,9 @@ class TriggerEngine:
     def note_video_stop(self) -> None:
         self.video_running = False
 
+    def note_slide(self) -> None:
+        self.state.last_slide_ts = time.time()
+
     # --- 摄像头 / 声控 ---
     def camera_allowed(self) -> tuple[bool, str]:
         self._roll_day()
@@ -294,13 +318,10 @@ class TriggerEngine:
             return False, "outside_active_hours"
         if self.state.camera_mb >= float(cm.get("max_mb_per_day") or 1e9):
             return False, "daily_quota"
-        now = time.time()
-        if (now - self.state.last_camera_start_ts) < float(cm.get("cooldown_s") or 0):
+        if (time.time() - self.state.last_camera_start_ts) < float(cm.get("cooldown_s") or 0):
             return False, "cooldown"
-        if au.get("enabled"):
-            if not in_time_window(au.get("active_hours")):
-                return False, "audio_outside_active_hours"
-        _ = au
+        if au.get("enabled") and not in_time_window(au.get("active_hours")):
+            return False, "audio_outside_active_hours"
         return True, "ok"
 
     def note_camera_start(self) -> None:
@@ -309,8 +330,16 @@ class TriggerEngine:
     def note_audio_start(self) -> None:
         self.state.last_audio_start_ts = time.time()
 
-    # --- 判定 ---
-    def decide(self, fg_title: str, idle_s: float, locked: bool = False) -> dict[str, Any]:
+    # --- 幻灯片翻页判定 ---
+    def slideshow_due(self) -> bool:
+        sl = self.rules.slideshow
+        if not sl.get("enabled"):
+            return False
+        return (time.time() - self.state.last_slide_ts) >= float(sl.get("cooldown_s") or 0)
+
+    # --- 录屏判定 ---
+    def decide(self, fg_title: str, idle_s: float, locked: bool = False,
+               slide_changed: bool = False) -> dict[str, Any]:
         self._roll_day()
         now = time.time()
         ph, vd = self.rules.photo, self.rules.video
@@ -320,6 +349,8 @@ class TriggerEngine:
             self.state.last_title = fg_title
             self.state.title_seen_ts = now
         title_stable_s = now - self.state.title_seen_ts
+        if slide_changed:
+            self.state.last_slide_ts = now
 
         # ---- 停止判定 ----
         if self.video_running:
@@ -342,12 +373,17 @@ class TriggerEngine:
                 self.state.last_reason = stop_reason
                 return out
 
-        # ---- 录像启动判定 ----
+        # ---- 录屏启动判定 ----
         if vd.get("enabled") and not self.video_running and not locked:
             ok = in_time_window(vd.get("active_hours"))
             ok = ok and self.state.video_mb < float(vd.get("max_mb_per_day") or 1e9)
             ok = ok and not title_match_any(fg_title, vd["when"].get("exclude_titles") or [])
             ok = ok and (now - self.state.last_video_start_ts) >= float(vd.get("cooldown_s") or 0)
+            if slide_changed and vd["when"].get("on_slideshow") and self.slideshow_due():
+                out["video_start"] = True
+                out["reason"] = "slideshow"
+                self.state.last_reason = out["reason"]
+                return out
             triggered, why = self._interest_trigger(vd["when"], title_stable_s, float(vd.get("settle_s") or 0))
             if ok and triggered:
                 out["video_start"] = True
@@ -361,15 +397,13 @@ class TriggerEngine:
             ok = ok and in_time_window(ph.get("active_hours"))
             ok = ok and (now - self.state.last_photo_ts) >= float(ph.get("min_interval_s") or 0)
             ok = ok and idle_s >= float(ph["when"].get("only_if_idle_s") or 0)
-            settle = float(ph.get("settle_s") or 0)
-            ok = ok and title_stable_s >= settle
+            ok = ok and title_stable_s >= float(ph.get("settle_s") or 0)
             out["photo"] = bool(ok)
             if ok:
                 self.state.last_reason = "photo:interval"
         return out
 
     def _interest_trigger(self, when: dict, title_stable_s: float, settle_s: float) -> tuple[bool, str]:
-        """“值得录”的判定。配置了条件就按条件走，什么都没配就是周期录制。"""
         want_change = bool(when.get("on_foreground_change"))
         want_slideshow = bool(when.get("on_slideshow"))
         if not want_change and not want_slideshow:
