@@ -80,7 +80,7 @@ DEFAULT_RULES: dict[str, Any] = {
             "enabled": True,
             "titles": ["PowerPoint 幻灯片放映", "Slide Show", "Presentation"],
             "threshold": 12,
-            "cooldown_s": 3,
+            "cooldown_s": 8,
             "poll_s": 4,
         },
     },
@@ -332,6 +332,7 @@ class TriggerEngine:
 
     # --- 幻灯片翻页判定 ---
     def slideshow_due(self) -> bool:
+        """距上次因翻页而开录已过冷却；冷却在真正开录时才刷新。"""
         sl = self.rules.slideshow
         if not sl.get("enabled"):
             return False
@@ -349,8 +350,6 @@ class TriggerEngine:
             self.state.last_title = fg_title
             self.state.title_seen_ts = now
         title_stable_s = now - self.state.title_seen_ts
-        if slide_changed:
-            self.state.last_slide_ts = now
 
         # ---- 停止判定 ----
         if self.video_running:
@@ -380,6 +379,7 @@ class TriggerEngine:
             ok = ok and not title_match_any(fg_title, vd["when"].get("exclude_titles") or [])
             ok = ok and (now - self.state.last_video_start_ts) >= float(vd.get("cooldown_s") or 0)
             if slide_changed and vd["when"].get("on_slideshow") and self.slideshow_due():
+                self.state.last_slide_ts = now
                 out["video_start"] = True
                 out["reason"] = "slideshow"
                 self.state.last_reason = out["reason"]
