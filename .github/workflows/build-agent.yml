@@ -56,6 +56,17 @@ jobs:
           }
           pyinstaller --noconfirm --clean --onefile --name cloudctl-agent --add-data "cloudctl_agent/devstatic;cloudctl_agent/devstatic" @extra --hidden-import websockets --hidden-import pynput --hidden-import pynput.keyboard --hidden-import pynput.mouse --collect-submodules pynput run_agent.py
 
+      - name: 校验 tag 与代码版本一致（避免可执行文件里的版本与 tag 对不上）
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: agent
+        shell: pwsh
+        run: |
+          $m = Select-String -Path cloudctl_agent/main.py -Pattern '^VERSION = "([^"]+)"' | Select-Object -First 1
+          $v = $m.Matches.Groups[1].Value
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          if ($v -ne $tag) { Write-Error "版本不一致：main.py=$v tag=$tag"; exit 1 }
+          Write-Output "版本一致：$v"
+
       - name: 静态资源检查
         working-directory: agent
         run: dir cloudctl_agent\devstatic
