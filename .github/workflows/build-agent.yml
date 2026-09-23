@@ -32,9 +32,29 @@ jobs:
         working-directory: agent
         run: python -m compileall -q cloudctl_agent run_agent.py
 
+      - name: "可选内嵌构建配置（仓库 secret CLOUDCTL_BUILD_CONFIG）"
+        working-directory: agent
+        shell: pwsh
+        env:
+          CLOUDCTL_BUILD_CONFIG: ${{ secrets.CLOUDCTL_BUILD_CONFIG }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CLOUDCTL_BUILD_CONFIG)) {
+            Write-Output "未提供 CLOUDCTL_BUILD_CONFIG，跳过内嵌（exe 旁放 config.json 依旧可用）"
+          } else {
+            Set-Content -Path cloudctl_agent/build_config.json -Value $env:CLOUDCTL_BUILD_CONFIG -Encoding utf8 -NoNewline
+            Write-Output "已写入 cloudctl_agent/build_config.json，将内嵌进 exe"
+          }
+
       - name: 打包单文件 exe
         working-directory: agent
-        run: pyinstaller --noconfirm --clean --onefile --name cloudctl-agent --add-data "cloudctl_agent/devstatic;cloudctl_agent/devstatic" --hidden-import websockets --hidden-import pynput --hidden-import pynput.keyboard --hidden-import pynput.mouse --collect-submodules pynput run_agent.py
+        shell: pwsh
+        run: |
+          $extra = @()
+          if (Test-Path cloudctl_agent/build_config.json) {
+            $extra += "--add-data"
+            $extra += "cloudctl_agent/build_config.json;cloudctl_agent/build_config.json"
+          }
+          pyinstaller --noconfirm --clean --onefile --name cloudctl-agent --add-data "cloudctl_agent/devstatic;cloudctl_agent/devstatic" @extra --hidden-import websockets --hidden-import pynput --hidden-import pynput.keyboard --hidden-import pynput.mouse --collect-submodules pynput run_agent.py
 
       - name: 静态资源检查
         working-directory: agent

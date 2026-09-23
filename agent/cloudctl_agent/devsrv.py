@@ -49,6 +49,16 @@ class DeviceServer:
         self.started_ts = 0.0
         self.requests = 0
         self.errors = 0
+        try:
+            from .storage import StoreManager
+            self.store = StoreManager(cfg, log, overrides=lambda: rules.data.get("storage") or {})
+        except Exception:
+            self.store = None
+        try:
+            from .storage import StoreManager
+            self.store = StoreManager(cfg, log, overrides=lambda: rules.data.get("storage") or {})
+        except Exception:
+            self.store = None
 
     # ------------------------------------------------------------ 生命周期
     def start(self) -> dict:
@@ -139,6 +149,8 @@ class DeviceServer:
                 "capture": {"camera": self.rules.camera.get("enabled"),
                             "audio_trigger": self.rules.audio.get("enabled"),
                             "threshold_db": self.rules.audio.get("threshold_db")},
+                "storage": self.store.info() if self.store else {},
+                "storage": self.store.info() if self.store else {},
                 "report": self.rules.report,
                 "update": self.rules.update,
                 "db": self.sync.db.summary(),

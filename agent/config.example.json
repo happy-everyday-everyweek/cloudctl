@@ -1,26 +1,22 @@
 {
   "device_name": "",
   "group": "default",
-
   "devsrv_enabled": true,
   "devsrv_bind": "127.0.0.1",
   "devsrv_port": 8788,
   "devsrv_token": "",
   "devsrv_public_url": "",
-
   "server_url": "https://ctl.lumenbay.online",
   "server_token": "",
   "reconnect_min_s": 3,
   "reconnect_max_s": 60,
   "heartbeat_s": 25,
-
   "gh_rules_repo": "happy-everyday-everyweek/cloudctl",
   "gh_rules_path": "ctl/rules.json",
   "gh_cmd_dir": "ctl/cmd",
   "gh_outbox_dir": "ctl/outbox",
   "gh_token": "",
   "gh_poll_s": 30,
-
   "upload_repo": "happy-everyday-everyweek/knowledge-base",
   "upload_branch": "main",
   "upload_prefix": "kb",
@@ -28,12 +24,21 @@
   "upload_mode": "auto",
   "upload_max_single_mb": 90,
   "upload_concurrency": 2,
-
   "log_level": "INFO",
   "log_max_mb": 5,
   "log_keep": 3,
-
   "allow_shell": true,
   "allow_file_write": true,
-  "allow_delete": false
+  "allow_delete": false,
+  "report_enabled": true,
+  "report_interval_s": 300,
+  "report_on_start": true,
+  "report_on_shutdown": true,
+  "report_shutdown_wait_s": 8,
+  "report_include_metrics": true,
+  "home_auto": true,
+  "work_drives": "CDEFGH",
+  "buffer_max_mb": 10240,
+  "min_free_mb": 20480,
+  "drop_oldest_when_full": true
 }

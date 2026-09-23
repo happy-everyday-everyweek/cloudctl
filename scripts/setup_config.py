@@ -116,6 +116,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--upload-prefix", default="")
     ap.add_argument("--mesh-token", default="")
     ap.add_argument("--mirror-pool", default="")
+    ap.add_argument("--embed", action="store_true",
+                    help="同时写入 agent/cloudctl_agent/build_config.json（构建时会被打进 exe）")
     ap.add_argument("--home", default="", help="工作目录，默认取环境变量或配置默认值")
     args = ap.parse_args(argv)
 
@@ -130,11 +132,17 @@ def main(argv: list[str] | None = None) -> int:
             pass
     cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    embed_path = AGENT / "cloudctl_agent" / "build_config.json"
+    if args.embed:
+        embed_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
     home = args.home or ""
     rules_path = write_rules(home, cfg)
 
     print("\n已写入：")
     print(f"  配置：{cfg_path}")
+    if args.embed:
+        print(f"  内嵌：{embed_path}（构建时会打进 exe；里面有令牌，不要提交、不要公开分发）")
     print(f"  规则：{rules_path}")
     print("\n接下来：")
     print("  1) 验证依赖：python -m cloudctl_agent.main --selftest")

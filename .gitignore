@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+agent/config.json
+agent/cloudctl_agent/build_config.json
+agent/dist/
+agent/.venv/
+*.spec

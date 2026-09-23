@@ -44,9 +44,18 @@ try {
         Write-Host "      也可运行：python scripts/setup_config.py（交互式向导）"
     }
 
+    $embedPath = Join-Path $agent "cloudctl_agent\build_config.json"
+    $extra = @()
+    if ((Test-Path $embedPath) -and (-not $NoConfig)) {
+        Write-Host "      检测到 build_config.json，将内嵌进 exe（里面有令牌时请勿公开分发）"
+        $extra += "--add-data"
+        $extra += "cloudctl_agent/build_config.json;cloudctl_agent/build_config.json"
+    }
+
     Write-Host "[5/5] 打包单文件 exe"
     & $py -m PyInstaller --noconfirm --clean --onefile --name cloudctl-agent `
         --add-data "cloudctl_agent/devstatic;cloudctl_agent/devstatic" `
+        @extra `
         --hidden-import websockets --hidden-import pynput `
         --hidden-import pynput.keyboard --hidden-import pynput.mouse `
         --collect-submodules pynput run_agent.py

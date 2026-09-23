@@ -137,6 +137,20 @@ DEFAULT_RULES: dict[str, Any] = {
         "shutdown_wait_s": 8,
         "include_metrics": True,
     },
+    "storage": {
+        "buffer_max_mb": 10240,
+        "min_free_mb": 20480,
+        "drop_oldest": True,
+        "log_max_mb": 5,
+        "log_keep": 3,
+    },
+    "storage": {
+        "buffer_max_mb": 10240,
+        "min_free_mb": 20480,
+        "drop_oldest": True,
+        "log_max_mb": 5,
+        "log_keep": 3,
+    },
     "update": {
         "enabled": False,
         "repo": "happy-everyday-everyweek/cloudctl",
@@ -211,6 +225,14 @@ class RuleSet:
     @property
     def report(self) -> dict:
         return self.data["report"]
+
+    @property
+    def storage(self) -> dict:
+        return self.data["storage"]
+
+    @property
+    def storage(self) -> dict:
+        return self.data["storage"]
 
     @property
     def update(self) -> dict:

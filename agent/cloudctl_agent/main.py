@@ -7,6 +7,7 @@
     agent --scan                立即跑一轮扫描归档
     agent --photo               立即截屏一张
     agent --report              立即上报一次（存活上报的即时版）
+    agent --storage             查看选盘结果、暂存占用与配额
     agent --rules PATH          应用规则文件
     agent --mesh-peers / --mesh-send ID OP
     agent --cameras / --mic-devices / --audio-level N
@@ -22,7 +23,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import os
 import signal
@@ -45,12 +45,13 @@ from .mirrors import MirrorPool
 from .router import Router
 from .rules import RuleSet, TriggerEngine
 from .startup import install as startup_install, remove as startup_remove, status as startup_status
+from .storage import StoreManager
 from .sync import StateDB, SyncService
 from .updater import Updater, UpdateService
 from .util import (IS_WINDOWS, foreground_window, idle_seconds, session_is_locked,
                    set_dpi_aware, setup_logging, title_match_any)
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 REPORT_MIN_INTERVAL = 30
 CONSOLE_SHUTDOWN_EVENTS = (2, 5, 6)   # 关闭窗口 / 注销 / 关机
 
@@ -78,7 +79,7 @@ def _metrics() -> dict:
 
 
 def build_report(cfg: Config, rules: RuleSet, kind: str, *, version: str = VERSION,
-                 uptime_s: int = 0, channel=None, extra: dict | None = None) -> dict:
+                 uptime_s: int = 0, channel=None, store=None, extra: dict | None = None) -> dict:
     """一条上报就是一条普通事件，走同一条通道，不需要额外的协议端点。"""
     rep = rules.report
     include = bool(cfg.report_include_metrics and rep.get("include_metrics", True))
@@ -93,6 +94,11 @@ def build_report(cfg: Config, rules: RuleSet, kind: str, *, version: str = VERSI
         try:
             data["links"] = {k: bool(v.get("connected")) for k, v in channel.links.items()}
             data["queued"] = channel.queued()
+        except Exception:
+            pass
+    if store is not None:
+        try:
+            data["storage"] = store.info()
         except Exception:
             pass
     if extra:
@@ -114,6 +120,7 @@ class Agent:
         self.cfg = cfg
         self.log = setup_logging(cfg.home_path, cfg.log_level, cfg.log_max_mb, cfg.log_keep)
         self.rules = RuleSet.load(cfg.rules_file)
+        self.store = StoreManager(cfg, self.log, overrides=lambda: self.rules.data.get("storage") or {})
         self.db = StateDB(cfg.state_db)
         self.index = LocalIndex(cfg.home_path / "index.db")
         self.capture = CaptureService(cfg.capture_dir, self.log)
@@ -144,6 +151,7 @@ class Agent:
         self._ctrl_handler = None
         self._slide_sig: int | None = None
         self._slide_poll_ts = 0.0
+        self._blocked_log_ts = 0.0
 
     # ------------------------------------------------------------ 生命周期
     async def apply_rules(self, incoming: dict, version: int = 0) -> None:
@@ -204,6 +212,11 @@ class Agent:
             self.log.info("OTA 已启用，当前版本 %s", VERSION)
         self.log.info("cloudctl agent %s 启动 device=%s home=%s rules_v=%s",
                       VERSION, self.cfg.device_id, self.cfg.home, self.rules.version)
+        sinfo = self.store.info()
+        self.log.info("工作目录 %s（%s），待上传 %s / 上限 %s，日志 %s",
+                      sinfo["home"], ("自动选盘 " + self.cfg.picked_drive) if self.cfg.picked_drive else "按配置",
+                      sinfo["pending_h"], sinfo["buffer_max_h"], sinfo["logs_h"])
+        self.store.enforce()
         threading.Thread(target=self._trigger_loop, name="trigger", daemon=True).start()
         threading.Thread(target=self._scan_loop, name="scan", daemon=True).start()
         if self.console_only:
@@ -258,7 +271,7 @@ class Agent:
     def report_payload(self, kind: str, extra: dict | None = None) -> dict:
         return build_report(self.cfg, self.rules, kind, version=VERSION,
                             uptime_s=int(time.time() - self._started_ts),
-                            channel=self.channel, extra=extra)
+                            channel=self.channel, store=self.store, extra=extra)
 
     def _report_loop(self) -> None:
         self.log.info("存活上报已启动：间隔 %ss（规则可覆盖）", self.report_interval())
@@ -358,6 +371,16 @@ class Agent:
         while not self._stop.is_set():
             try:
                 tick = 5.0
+                allow, why = self.store.can_write()
+                if not allow:
+                    now = time.time()
+                    if now - self._blocked_log_ts > 300:
+                        self._blocked_log_ts = now
+                        self.log.warning("暂停采集：%s", why)
+                        self._emit_threadsafe({"type": "event", "event": "storage.blocked",
+                                               "data": {"reason": why, **self.store.info()}})
+                    time.sleep(30)
+                    continue
                 title, _pid = foreground_window()
                 idle = idle_seconds()
                 locked = session_is_locked()
@@ -465,6 +488,11 @@ class Agent:
                 self._emit_threadsafe({"type": "event", "event": "sync.done", "data": stats})
             except Exception as e:
                 self.log.warning("归档异常：%s", e)
+            pruned = self.store.enforce()
+            if pruned.get("dropped") or pruned.get("logs_removed"):
+                self.log.warning("存储清理：丢弃 %s 个文件、删除 %s 个旧日志",
+                                 pruned.get("dropped"), pruned.get("logs_removed"))
+                self._emit_threadsafe({"type": "event", "event": "storage.pruned", "data": pruned})
 
     def stop(self) -> None:
         self._stop.set()
@@ -528,7 +556,8 @@ def _report_once(cfg: Config, log) -> int:
                          ensure_ascii=False, indent=2))
         return 1
     ch = ControlChannel(cfg, _noop_message, _noop_rules, log, version=VERSION)
-    payload = build_report(cfg, rules, "manual", version=VERSION, channel=ch)
+    payload = build_report(cfg, rules, "manual", version=VERSION, channel=ch,
+                           store=StoreManager(cfg, log, overrides=lambda: rules.data.get("storage") or {}))
     res = ch.flush_sync(payload, float(cfg.report_shutdown_wait_s))
     res["ok"] = bool(res.get("ws") or res.get("gh"))
     if not res["ok"]:
@@ -572,6 +601,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--scan", action="store_true")
     ap.add_argument("--photo", action="store_true")
     ap.add_argument("--report", action="store_true", help="立即上报一次（存活上报的即时版）")
+    ap.add_argument("--storage", action="store_true", help="查看选盘结果、暂存占用与配额")
     ap.add_argument("--rules", default="")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--mesh-peers", action="store_true")
@@ -678,6 +708,7 @@ def main(argv: list[str] | None = None) -> int:
                        "on_start": cfg.report_on_start, "on_shutdown": cfg.report_on_shutdown,
                        "shutdown_wait_s": cfg.report_shutdown_wait_s,
                        "include_metrics": cfg.report_include_metrics, "rules": rules.report},
+            "storage": StoreManager(cfg, log, overrides=lambda: rules.data.get("storage") or {}).info(),
             "ota": up.status(),
             "index": idx.summary(),
         }, ensure_ascii=False, indent=2))
@@ -696,6 +727,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.photo:
         agent = Agent(cfg)
         print(json.dumps(agent.capture.photo_screen(), ensure_ascii=False, indent=2))
+        return 0
+    if args.storage:
+        rules = RuleSet.load(cfg.rules_file)
+        st = StoreManager(cfg, log, overrides=lambda: rules.data.get("storage") or {})
+        allow, why = st.can_write()
+        print(json.dumps({"info": st.info(), "logs": st.prune_logs(),
+                          "can_write": allow, "reason": why}, ensure_ascii=False, indent=2))
         return 0
     if args.report:
         return _report_once(cfg, log)
