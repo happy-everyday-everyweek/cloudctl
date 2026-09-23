@@ -39,7 +39,7 @@
   "home_auto": true,
   "work_drives": "CDEFGH",
   "buffer_max_mb": 10240,
-  "min_free_mb": 2048,
+  "min_free_mb": 0,
   "drop_oldest_when_full": true,
   "p2p_enabled": true,
   "p2p_bind": "0.0.0.0",
@@ -48,5 +48,7 @@
   "p2p_public_host": "",
   "p2p_public_port": 0,
   "p2p_keepalive_s": 20,
-  "p2p_inbox_max_mb": 4096
+  "p2p_inbox_max_mb": 4096,
+  "disk_free_ratio": 0.4,
+  "buffer_max_ratio": 0.6
 }

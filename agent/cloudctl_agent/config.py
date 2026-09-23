@@ -114,7 +114,9 @@ class Config:
     home_auto: bool = True                 # 自动选盘（有 D / E 盘时按剩余空间挑）
     work_drives: str = "CDEFGH"            # 候选盘符
     buffer_max_mb: int = 10240             # 待上传暂存上限，默认 10G
-    min_free_mb: int = 2048                # 盘上至少留这么多余量，低于它停止写盘（选盘不卡这个值）
+    min_free_mb: int = 0                   # 绝对保留量下限（默认 0，交给比例说话）
+    disk_free_ratio: float = 0.4           # 盘上至少保留总容量的这个比例（默认保留 40%，即最多用 60%）
+    buffer_max_ratio: float = 0.6          # 待上传暂存额度 = 剩余空间 × 这个比例（与绝对上限取更小值）
     drop_oldest_when_full: bool = True     # 超限且传不出去时，允许丢最旧的
     picked_drive: str = ""                 # 上次自动选中的盘（只读展示用）
 
@@ -279,6 +281,11 @@ class Config:
                 elif isinstance(f.default, int):
                     try:
                         val = int(val)
+                    except ValueError:
+                        continue
+                elif isinstance(f.default, float):
+                    try:
+                        val = float(val)
                     except ValueError:
                         continue
                 data[f.name] = val

@@ -6,6 +6,11 @@ on:
     branches: [main]
     paths: ['agent/**', '.github/workflows/build-agent.yml']
   workflow_dispatch:
+    inputs:
+      embed:
+        description: "把仓库密钥 CLOUDCTL_BUILD_CONFIG 内嵌进 exe（仅手动触发时生效）"
+        type: boolean
+        default: false
 
 # 发布 Release 需要写权限；仓库默认只读时，缺少这段会导致打 tag 后步骤失败
 permissions:

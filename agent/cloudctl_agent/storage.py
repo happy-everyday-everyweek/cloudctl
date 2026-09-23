@@ -44,6 +44,13 @@ def free_mb(p: Path) -> int:
         return -1
 
 
+def total_mb(p: Path) -> int:
+    try:
+        return int(shutil.disk_usage(str(p)).total // (1024 * 1024))
+    except Exception:
+        return -1
+
+
 def pick_data_drive(letters: str = DEFAULT_CANDIDATES, min_free_mb: int = DEFAULT_MIN_FREE_MB,
                     prefer_non_system: bool = True) -> dict | None:
     """挑剩余空间最大的一块盘，优先非系统盘。
@@ -111,7 +118,9 @@ class StoreManager:
         drop = bool(self.cfg.drop_oldest_when_full)
         if "drop_oldest" in o:
             drop = bool(o["drop_oldest"])
-        return {"buffer_max_mb": buf, "min_free_mb": min_free, "drop_oldest": drop}
+        return {"buffer_max_mb": buf, "min_free_mb": min_free, "drop_oldest": drop,
+                "disk_free_ratio": float(self.cfg.disk_free_ratio),
+                "buffer_max_ratio": float(self.cfg.buffer_max_ratio)}
 
     # ------------------------------------------------------------ 统计
     def pending_dirs(self) -> list[Path]:
@@ -192,6 +201,10 @@ class StoreManager:
             "buffer_max_h": human_mb(conf["buffer_max_mb"]),
             "buffer_used_pct": round(pending * 100.0 / max(1, conf["buffer_max_mb"] * 1024 * 1024), 1),
             "min_free_mb": conf["min_free_mb"],
+            "disk_total_h": human_mb(total_mb(self.cfg.home_path)) if total_mb(self.cfg.home_path) > 0 else "未知",
+            "disk_free_ratio": conf["disk_free_ratio"],
+            "buffer_max_ratio": conf["buffer_max_ratio"],
+            "quota_mb": self.quota_mb(free if free > 0 else 0, conf),
             "logs_bytes": logs,
             "logs_h": human_mb(logs / (1024 * 1024)),
             "log_total_max_mb": lc["total_max_mb"],
@@ -202,17 +215,28 @@ class StoreManager:
         }
 
     # ------------------------------------------------------------ 写盘闸门
+    def quota_mb(self, free: int, conf: dict) -> int:
+        """暂存上限取两者的更小值：绝对上限，与“剩余空间 × 比例”。"""
+        by_ratio = int(free * conf["buffer_max_ratio"])
+        return max(1, min(conf["buffer_max_mb"], by_ratio))
+
     def can_write(self, need_mb: int = 0) -> tuple[bool, str]:
-        """采集前问一句：盘还有余量吗？暂存区还有额度吗？"""
+        """采集前问一句：盘还够吗（按比例保留）、暂存区还有额度吗？"""
         conf = self.conf()
         free = free_mb(self.cfg.home_path)
-        if 0 <= free < conf["min_free_mb"] + int(need_mb):
-            self.blocked_reason = f"磁盘剩余 {human_mb(free)} 低于阀值 {human_mb(conf['min_free_mb'])}"
+        total = total_mb(self.cfg.home_path)
+        floor = int(total * conf["disk_free_ratio"]) if total > 0 else 0
+        floor = max(floor, conf["min_free_mb"])
+        if 0 <= free < floor + int(need_mb):
+            self.blocked_reason = (f"磁盘剩余 {human_mb(free)} 已低于保留量 {human_mb(floor)}"
+                                   f"（总容量 {human_mb(total)} × {conf['disk_free_ratio']:.0%}）")
             return False, self.blocked_reason
         used_mb = self.pending_bytes() / (1024 * 1024)
-        if used_mb + need_mb > conf["buffer_max_mb"]:
-            self.blocked_reason = (f"待上传暂存 {human_mb(used_mb)} 已达上限 "
-                                   f"{human_mb(conf['buffer_max_mb'])}")
+        quota = self.quota_mb(free, conf)
+        if used_mb + need_mb > quota:
+            self.blocked_reason = (f"待上传暂存 {human_mb(used_mb)} 已达额度 {human_mb(quota)}"
+                                   f"（= min(上限 {human_mb(conf['buffer_max_mb'])}, "
+                                   f"剩余空间 {human_mb(free)} × {conf['buffer_max_ratio']:.0%})）")
             return False, self.blocked_reason
         self.blocked_reason = ""
         return True, "ok"

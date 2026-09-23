@@ -264,6 +264,8 @@ class P2PService:
         total = (len(data) + CHUNK - 1) // CHUNK
         meta = {"name": fname, "total": total, "size": len(data)}
         self.tx_cache[fname] = (data, meta)
+        while len(self.tx_cache) > 4:
+            self.tx_cache.pop(next(iter(self.tx_cache)))
         ok = 0
         for seq in range(total):
             part = data[seq * CHUNK:(seq + 1) * CHUNK]
@@ -412,6 +414,14 @@ class P2PService:
                 except Exception:
                     p.state = "down"
             self.prune_files()
+            self.prune_frags()
+
+    def prune_frags(self) -> None:
+        """半途而废的传输留的碎片表定期清掉，避免长期运行吃掉内存。"""
+        keep = set(self.tx_cache.keys())
+        for name in list(self.rx_frags.keys()):
+            if name not in keep and not (self.inbox / f"{name}.part").exists():
+                self.rx_frags.pop(name, None)
 
     def prune_files(self) -> None:
         """收取目录不无限长：超过上限就删最旧的已经收完的文件。"""

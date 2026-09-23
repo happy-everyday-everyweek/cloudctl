@@ -52,7 +52,7 @@ from .updater import Updater, UpdateService
 from .util import (IS_WINDOWS, foreground_window, idle_seconds, session_is_locked,
                    set_dpi_aware, setup_logging, title_match_any)
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 REPORT_MIN_INTERVAL = 30
 CONSOLE_SHUTDOWN_EVENTS = (2, 5, 6)   # 关闭窗口 / 注销 / 关机
 
