@@ -1,10 +1,15 @@
-"""配置加载：config.json + 环境变量覆盖。
+"""配置加载：config.json + 内嵌构建配置 + 环境变量覆盖。
 
-优先级：环境变量 > config.json > 默认值。默认工作目录：Windows 为 %ProgramData%\\cloudctl。
+优先级（从高到低）：环境变量 > exe 旁的 config.json > 内嵌 build_config.json > 默认值。
 
-配置文件位置：源码方式运行是 agent/config.json；单文件 exe 运行时是 exe 旁边的
-config.json（打包后 __file__ 指向临时解包目录，不能用它推路径）；
-两者都可以用环境变量 CLOUDCTL_CONFIG 指到任意路径。
+配置文件位置：
+  - 源码方式运行：agent/config.json
+  - 单文件 exe：exe 旁边的 config.json（打包后 __file__ 指向临时解包目录，不能用它推路径）
+  - 内嵌默认：cloudctl_agent/build_config.json，构建时用 --add-data 打进去，
+    适合做“装上去就能连”的发行包；本机再放一个 config.json 就能盖掉内嵌值。
+  - 三种都可以用环境变量 CLOUDCTL_CONFIG 指到任意路径。
+
+默认工作目录：Windows 为 %ProgramData%\\cloudctl。
 
 三类入口：设备本地控制台（devsrv）、两条平行外联通道（WS / GitHub）、局域网互联（mesh）。
 上报：存活上报与关机上报（report）。
@@ -195,6 +200,7 @@ class Config:
     # --- 读写 ---
     @classmethod
     def path(cls) -> Path:
+        """外部配置（可读写）路径。"""
         env = os.environ.get("CLOUDCTL_CONFIG")
         if env:
             return Path(env)
@@ -203,14 +209,25 @@ class Config:
         return Path(__file__).resolve().parent.parent / "config.json"
 
     @classmethod
+    def bundled_path(cls) -> Path:
+        """构建时内嵌进包的配置（PyInstaller --add-data cloudctl_agent/build_config.json）。"""
+        return Path(__file__).resolve().parent / "build_config.json"
+
+    @staticmethod
+    def _read_dict(p: Path) -> dict[str, Any]:
+        if not p.exists():
+            return {}
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @classmethod
     def load(cls) -> "Config":
-        raw: dict[str, Any] = {}
-        p = cls.path()
-        if p.exists():
-            try:
-                raw = json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                raw = {}
+        raw = cls._read_dict(cls.bundled_path())          # 内嵌默认
+        external = cls._read_dict(cls.path())             # 本机覆盖优先
+        raw.update(external)
         known = {f.name for f in fields(cls)}
         data = {k: v for k, v in raw.items() if k in known}
         for f in fields(cls):
