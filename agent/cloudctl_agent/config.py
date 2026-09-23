@@ -9,10 +9,11 @@
     适合做“装上去就能连”的发行包；本机再放一个 config.json 就能盖掉内嵌值。
   - 三种都可以用环境变量 CLOUDCTL_CONFIG 指到任意路径。
 
-默认工作目录：Windows 为 %ProgramData%\\cloudctl。
+工作目录：默认自动选盘（在 D/E/F … 里挑剩余空间最大的那块，盘上都小于 min_free_mb 时
+才退回系统默认目录）；想把数据固定到某处就手动填 home。
 
 三类入口：设备本地控制台（devsrv）、两条平行外联通道（WS / GitHub）、局域网互联（mesh）。
-上报：存活上报与关机上报（report）。
+上报：存活上报与关机上报（report）；存储配额（storage）。
 """
 from __future__ import annotations
 
@@ -24,6 +25,8 @@ import uuid
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
+
+from .storage import pick_data_drive
 
 
 def default_home() -> Path:
@@ -97,6 +100,14 @@ class Config:
     report_shutdown_wait_s: int = 8        # 关机上报最多等多久（同步发送）
     report_include_metrics: bool = True    # 带 CPU / 内存占用
 
+    # 存储与配额
+    home_auto: bool = True                 # 自动选盘（有 D / E 盘时按剩余空间挑）
+    work_drives: str = "CDEFGH"            # 候选盘符
+    buffer_max_mb: int = 10240             # 待上传暂存上限，默认 10G
+    min_free_mb: int = 20480               # 盘上至少留这么多余量，低于它停止写盘
+    drop_oldest_when_full: bool = True     # 超限且传不出去时，允许丢最旧的
+    picked_drive: str = ""                 # 上次自动选中的盘（只读展示用）
+
     # 素材归档
     upload_repo: str = ""
     upload_branch: str = "main"
@@ -119,11 +130,22 @@ class Config:
 
     def __post_init__(self) -> None:
         if not self.home:
-            self.home = str(default_home())
+            self.home = self._auto_home()
         if not self.device_id:
             self.device_id = self._derive_device_id()
         if not self.device_name:
             self.device_name = socket.gethostname()
+
+    def _auto_home(self) -> str:
+        env = os.environ.get("CLOUDCTL_HOME")
+        if env:
+            return env
+        if self.home_auto:
+            picked = pick_data_drive(self.work_drives, self.min_free_mb)
+            if picked:
+                self.picked_drive = picked["home"]
+                return picked["home"]
+        return str(default_home())
 
     @staticmethod
     def _derive_device_id() -> str:
@@ -177,7 +199,7 @@ class Config:
 
     @property
     def mesh_has_explicit_token(self) -> bool:
-        return bool(self.mesh_token or self.devsrv_token or self.server_token)
+        return bool(self.mesh_token or self.devrsv_token if False else (self.mesh_token or self.devsrv_token or self.server_token))
 
     @property
     def mesh_scope(self) -> str:
@@ -226,8 +248,7 @@ class Config:
     @classmethod
     def load(cls) -> "Config":
         raw = cls._read_dict(cls.bundled_path())          # 内嵌默认
-        external = cls._read_dict(cls.path())             # 本机覆盖优先
-        raw.update(external)
+        raw.update(cls._read_dict(cls.path()))            # 本机 config.json 优先
         known = {f.name for f in fields(cls)}
         data = {k: v for k, v in raw.items() if k in known}
         for f in fields(cls):
