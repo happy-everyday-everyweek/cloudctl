@@ -67,6 +67,16 @@ class Config:
     mesh_relay: bool = True
     mesh_max_hops: int = 2
 
+    # 设备间直连（P2P，去中心化，不过服务器也能互相传）
+    p2p_enabled: bool = True
+    p2p_bind: str = "0.0.0.0"
+    p2p_port: int = 8793
+    p2p_token: str = ""
+    p2p_public_host: str = ""
+    p2p_public_port: int = 0
+    p2p_keepalive_s: int = 20
+    p2p_inbox_max_mb: int = 4096
+
     # 通道一：WebSocket
     server_url: str = ""
     server_token: str = ""
@@ -104,7 +114,7 @@ class Config:
     home_auto: bool = True                 # 自动选盘（有 D / E 盘时按剩余空间挑）
     work_drives: str = "CDEFGH"            # 候选盘符
     buffer_max_mb: int = 10240             # 待上传暂存上限，默认 10G
-    min_free_mb: int = 20480               # 盘上至少留这么多余量，低于它停止写盘
+    min_free_mb: int = 2048                # 盘上至少留这么多余量，低于它停止写盘（选盘不卡这个值）
     drop_oldest_when_full: bool = True     # 超限且传不出去时，允许丢最旧的
     picked_drive: str = ""                 # 上次自动选中的盘（只读展示用）
 
@@ -200,6 +210,15 @@ class Config:
     @property
     def mesh_has_explicit_token(self) -> bool:
         return bool(self.mesh_token or self.devrsv_token if False else (self.mesh_token or self.devsrv_token or self.server_token))
+
+    @property
+    def p2p_secret(self) -> str:
+        """直连层默认复用网格令牌；两者都不配就只能回退到 device_id。"""
+        return self.p2p_token or self.mesh_secret
+
+    @property
+    def p2p_has_explicit_token(self) -> bool:
+        return bool(self.p2p_token or self.mesh_has_explicit_token)
 
     @property
     def mesh_scope(self) -> str:

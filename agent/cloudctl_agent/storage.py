@@ -46,20 +46,29 @@ def free_mb(p: Path) -> int:
 
 def pick_data_drive(letters: str = DEFAULT_CANDIDATES, min_free_mb: int = DEFAULT_MIN_FREE_MB,
                     prefer_non_system: bool = True) -> dict | None:
-    """在候选盘里挑剩余空间最大的那块；优先非系统盘。没有合适的返回 None。"""
+    """挑剩余空间最大的一块盘，优先非系统盘。
+
+    参考 min_free_mb 只是“理想余量”：所有盘都不达标时，宁可选剩余最多的那块并标上 low=True，
+    也不跳回默认目录——能不能写由采集闸门判断，不是选盘时判断。一块盘都没有必回 None。"""
     best: tuple[tuple[int, int], Path, int] | None = None
+    fallback: tuple[tuple[int, int], Path, int] | None = None
     for p in drive_candidates(letters):
         fm = free_mb(p)
-        if fm < 0 or fm < int(min_free_mb):
+        if fm < 0:
             continue
         non_system = not (p.drive or "").upper().startswith("C")
         rank = (0 if (prefer_non_system and non_system) else 1, -fm)
-        if best is None or rank < best[0]:
-            best = (rank, p, fm)
-    if best is None:
+        if fm >= int(min_free_mb):
+            if best is None or rank < best[0]:
+                best = (rank, p, fm)
+        elif fallback is None or rank < fallback[0]:
+            fallback = (rank, p, fm)
+    picked = best or fallback
+    if picked is None:
         return None
-    _, drv, fm = best
-    return {"drive": str(drv), "free_mb": fm, "home": str(drv / "cloudctl")}
+    _, drv, fm = picked
+    return {"drive": str(drv), "free_mb": fm, "home": str(drv / "cloudctl"),
+            "low": best is None}
 
 
 def human_mb(mb: int | float) -> str:

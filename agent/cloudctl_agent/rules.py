@@ -137,12 +137,10 @@ DEFAULT_RULES: dict[str, Any] = {
         "shutdown_wait_s": 8,
         "include_metrics": True,
     },
-    "storage": {
-        "buffer_max_mb": 10240,
-        "min_free_mb": 20480,
-        "drop_oldest": True,
-        "log_max_mb": 5,
-        "log_keep": 3,
+    "p2p": {
+        "enabled": True,
+        "keepalive_s": 20,
+        "inbox_max_mb": 4096,
     },
     "storage": {
         "buffer_max_mb": 10240,
@@ -227,8 +225,8 @@ class RuleSet:
         return self.data["report"]
 
     @property
-    def storage(self) -> dict:
-        return self.data["storage"]
+    def p2p(self) -> dict:
+        return self.data["p2p"]
 
     @property
     def storage(self) -> dict:

@@ -42,6 +42,7 @@ from .devsrv import STATIC, DeviceServer
 from .indexer import LocalIndex, RepoIndex
 from .mesh import MeshService
 from .mirrors import MirrorPool
+from .p2p import P2PService
 from .router import Router
 from .rules import RuleSet, TriggerEngine
 from .startup import install as startup_install, remove as startup_remove, status as startup_status
@@ -138,6 +139,7 @@ class Agent:
         self.channel: ControlChannel | None = None
         self.devsrv: DeviceServer | None = None
         self.mesh: MeshService | None = None
+        self.p2p: P2PService | None = None
         self.router: Router | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.console_only = False
@@ -202,6 +204,12 @@ class Agent:
         if self.mesh.start().get("enabled"):
             self.log.info("局域网互联 mesh=%s http=%s 发现端口=%s",
                           self.cfg.mesh_scope, self.cfg.mesh_port, self.cfg.mesh_discovery_port)
+        self.p2p = P2PService(self.cfg, self.log,
+                              on_event=lambda ev: self._emit_threadsafe({"type": "event", **ev}),
+                              relay_send=self._p2p_relay)
+        pinfo = self.p2p.start()
+        if pinfo.get("enabled"):
+            self.log.info("P2P 直连层已启动，候选端点 %s", pinfo.get("candidates"))
         self.camcap = VoiceCameraService(self.cfg, self.rules, self.engine, self.log,
                                          on_event=self._emit_threadsafe,
                                          capture_dir=self.cfg.capture_dir / "camera")
@@ -238,6 +246,23 @@ class Agent:
             self._stop.set()
             self._shutdown_report("exit")
 
+    def _p2p_relay(self, peer_id: str, blob: bytes) -> bool:
+        """直连不通时的兜底：交给网格里对端可达的邻居转一手。没有能力就老实返回失败。"""
+        mesh = self.mesh
+        if mesh is None:
+            return False
+        fn = getattr(mesh, "send_blob", None) or getattr(mesh, "relay_blob", None)
+        if fn is None:
+            return False
+        try:
+            res = fn(peer_id, f"p2p-{int(time.time() * 1000)}.bin", blob)
+            if isinstance(res, dict) and res.get("ok") is False:
+                return False
+            return bool(res)
+        except Exception as e:
+            self.log.debug("P2P 中继失败：%s", e)
+            return False
+
     async def _emit(self, obj: dict) -> None:
         if self.channel:
             await self.channel.send(obj)
@@ -269,9 +294,12 @@ class Agent:
         return float(max(REPORT_MIN_INTERVAL, n))
 
     def report_payload(self, kind: str, extra: dict | None = None) -> dict:
+        merged = dict(extra or {})
+        if self.p2p is not None:
+            merged.setdefault("p2p", self.p2p.status())
         return build_report(self.cfg, self.rules, kind, version=VERSION,
                             uptime_s=int(time.time() - self._started_ts),
-                            channel=self.channel, store=self.store, extra=extra)
+                            channel=self.channel, store=self.store, extra=merged or None)
 
     def _report_loop(self) -> None:
         self.log.info("存活上报已启动：间隔 %ss（规则可覆盖）", self.report_interval())
@@ -503,7 +531,7 @@ class Agent:
                 loop.call_soon_threadsafe(task.cancel)
             except Exception:
                 pass
-        for svc in (self.devsrv, self.mesh, self.camcap, self.updates):
+        for svc in (self.devsrv, self.mesh, self.p2p, self.camcap, self.updates):
             if svc is not None:
                 try:
                     svc.stop()
@@ -566,6 +594,32 @@ def _report_once(cfg: Config, log) -> int:
     return 0 if res["ok"] else 1
 
 
+def _p2p_probe(cfg: Config, log, args) -> int:
+    """--p2p-ping ID=IP:PORT / --p2p-push ID=IP:PORT FILE：手动验证打洞与传输。"""
+    svc = P2PService(cfg, log)
+    info = svc.start()
+    if not info.get("enabled"):
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+        return 1
+    target = args.p2p_ping or (args.p2p_push[0] if args.p2p_push else "")
+    out: dict = {"self": svc.status()}
+    if target:
+        peer_id, _, addr = target.partition("=")
+        host, _, port = addr.partition(":")
+        out["punch"] = svc.add_peer(peer_id, [(host, int(port or cfg.p2p_port))])
+        for _ in range(20):
+            time.sleep(0.3)
+            if svc.path_state(peer_id) == "direct":
+                break
+        out["state"] = svc.path_state(peer_id)
+    if args.p2p_push:
+        out["push"] = svc.push_file(target.split("=")[0], Path(args.p2p_push[1]))
+    out["after"] = svc.status()
+    svc.stop()
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
 def _audio_probe(cfg: Config, seconds: int) -> int:
     rules = RuleSet.load(cfg.rules_file)
     au = rules.audio
@@ -602,6 +656,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--photo", action="store_true")
     ap.add_argument("--report", action="store_true", help="立即上报一次（存活上报的即时版）")
     ap.add_argument("--storage", action="store_true", help="查看选盘结果、暂存占用与配额")
+    ap.add_argument("--p2p-status", action="store_true", help="看直连层候选端点与已建立路径")
+    ap.add_argument("--p2p-ping", default="", help="对指定设备打洞，格式 ID=IP:PORT")
+    ap.add_argument("--p2p-push", nargs=2, default=None, help="P2P 推一个文件：ID=IP:PORT FILE")
     ap.add_argument("--rules", default="")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--mesh-peers", action="store_true")
@@ -698,6 +755,9 @@ def main(argv: list[str] | None = None) -> int:
                      "port": cfg.mesh_port, "discovery_port": cfg.mesh_discovery_port,
                      "accept_cmd": cfg.mesh_accept_cmd, "relay": cfg.mesh_relay,
                      "max_hops": cfg.mesh_max_hops},
+            "p2p": {"enabled": cfg.p2p_enabled, "bind": cfg.p2p_bind, "port": cfg.p2p_port,
+                    "token_set": cfg.p2p_has_explicit_token, "keepalive_s": cfg.p2p_keepalive_s,
+                    "public_host": cfg.p2p_public_host},
             "channels": {"ws": bool(cfg.server_url), "gh": bool(cfg.gh_rules_repo),
                          "mirror_top": cfg.gh_mirror_top},
             "capture": {"camera": rules.camera.get("enabled"),
@@ -735,6 +795,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"info": st.info(), "logs": st.prune_logs(),
                           "can_write": allow, "reason": why}, ensure_ascii=False, indent=2))
         return 0
+    if args.p2p_status or args.p2p_ping or args.p2p_push:
+        return _p2p_probe(cfg, log, args)
     if args.report:
         return _report_once(cfg, log)
 
